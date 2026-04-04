@@ -1,0 +1,2 @@
+include config.example.yaml
+include hikvision-viewer.desktop

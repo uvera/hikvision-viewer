@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Hikvision Viewer
+GenericName=RTSP camera viewer
+Comment=View multiple IP camera RTSP streams (e.g. Hikvision)
+Exec=hikvision-viewer
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;Network;
+Keywords=camera;rtsp;security;mpv;hikvision;
+StartupNotify=true

@@ -1,0 +1,25 @@
+# Copy to $XDG_CONFIG_HOME/hikvision-viewer/config.yaml (default ~/.config/hikvision-viewer/config.yaml)
+# and adjust. Optional secrets: .env or .env.enc in the same two places (XDG dir first, then
+# the directory containing this config; the latter overrides). Use the viewer's "Encrypt env…"
+# button to move .env → .env.enc; the OS keyring holds the Fernet key (Secret Service / Keychain).
+# {ENV_VAR} is substituted from the environment after loading those files.
+#
+# Viewer env (optional): HIKVISION_MPV_SUBPROCESS=1 (default) uses one mpv process per
+# tile (more stable than embedded libmpv). HIKVISION_MPV_HWDEC=no (default) avoids many
+# multi-stream GPU crashes; set to auto for hardware decode. HIKVISION_MPV_VO=gpu.
+# On Wayland, Qt uses xcb (XWayland) and WAYLAND_DISPLAY is unset for this process so each
+# mpv child also uses X11 and honors --wid (otherwise mpv opens separate Wayland windows).
+# Set HIKVISION_QT_WAYLAND=1 to keep Wayland (no embedding). HIKVISION_MPV_VO=x11 if gpu fails.
+streams:
+  side_enterance:
+    url: rtsp://admin:{CAM_SIDE_ENTERANCE_PASSWORD}@{CAM_SIDE_ENTERANCE_IP}:554/Streaming/Channels/101
+  side_enterance_sub:
+    url: rtsp://admin:{CAM_SIDE_ENTERANCE_PASSWORD}@{CAM_SIDE_ENTERANCE_IP}:554/Streaming/Channels/102
+  front_yard:
+    url: rtsp://admin:{CAM_FRONT_YARD_PASSWORD}@{CAM_FRONT_YARD_IP}:554/Streaming/Channels/101
+  front_yard_sub:
+    url: rtsp://admin:{CAM_FRONT_YARD_PASSWORD}@{CAM_FRONT_YARD_IP}:554/Streaming/Channels/102
+  gate:
+    url: rtsp://admin:{CAM_GATE_PASSWORD}@{CAM_GATE_IP}:554/Streaming/Channels/101
+  gate_sub:
+    url: rtsp://admin:{CAM_GATE_PASSWORD}@{CAM_GATE_IP}:554/Streaming/Channels/102

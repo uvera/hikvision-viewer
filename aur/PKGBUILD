@@ -1,0 +1,29 @@
+# Maintainer: Your Name <you@example.com>
+#
+# Before publishing: set pkgver to match pyproject.toml, update url= and source= to your
+# upstream (e.g. source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")).
+# For a local test tarball: parent folder inside the archive must be $pkgname-$pkgver.
+
+pkgname=hikvision-viewer
+pkgver=0.1.0
+pkgrel=2
+pkgdesc="PyQt6 multi-stream RTSP viewer for IP cameras"
+arch=('any')
+url='https://github.com/USERNAME/hikvision-viewer'
+license=('MIT')
+depends=('python' 'mpv' 'python-pyqt6' 'python-pyyaml' 'python-cryptography' 'python-keyring' 'python-dotenv' 'python-mpv')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+install=hikvision-viewer.install
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('5ec422cf9dd506e905b817f767d6b0789032e68dfec625bf0de481831fd7eae2')
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  python -m installer --destdir="$pkgdir" --prefix=/usr dist/*.whl
+  install -Dm644 config.example.yaml -t "${pkgdir}/usr/share/doc/${pkgname}/"
+}

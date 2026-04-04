@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.tar.gz
+.env
+.env.enc
+config.yaml
+
+# AUR / makepkg (build under aur/)
+aur/pkg/
+aur/src/
+aur/*.pkg.tar.*
+aur/*.sig
