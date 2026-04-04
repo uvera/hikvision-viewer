@@ -148,6 +148,7 @@ class StreamTile(QWidget):
         hwdec, vo = _mpv_hwdec(), _mpv_vo()
         args = [
             "--no-terminal",
+            "--mute",
             "--keep-open=yes",
             f"--wid={wid}",
             "--rtsp-transport=tcp",
@@ -185,6 +186,7 @@ class StreamTile(QWidget):
         opts: dict = dict(
             wid=str(wid),
             vo=vo,
+            mute=True,
             hwdec=_mpv_hwdec(),
             rtsp_transport="tcp",
             cache="no",
