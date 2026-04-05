@@ -10,6 +10,14 @@
 # On Wayland, Qt uses xcb (XWayland) and WAYLAND_DISPLAY is unset for this process so each
 # mpv child also uses X11 and honors --wid (otherwise mpv opens separate Wayland windows).
 # Set HIKVISION_QT_WAYLAND=1 to keep Wayland (no embedding). HIKVISION_MPV_VO=x11 if gpu fails.
+#
+# Optional viewer: block (same keys as the in-app configuration editor). Applied at startup unless
+# the corresponding HIKVISION_* env var is already set to a non-empty value in the shell.
+# viewer:
+#   mpv_subprocess: true
+#   mpv_hwdec: "no"
+#   mpv_vo: "gpu"
+#   qt_wayland: false
 streams:
   side_enterance:
     url: rtsp://admin:{CAM_SIDE_ENTERANCE_PASSWORD}@{CAM_SIDE_ENTERANCE_IP}:554/Streaming/Channels/101

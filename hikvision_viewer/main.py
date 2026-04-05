@@ -19,8 +19,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from hikvision_viewer.config_editor import open_config_editor
 from hikvision_viewer.config_loader import (
     app_config_dir,
+    apply_viewer_from_yaml,
     load_streams,
     resolve_config_path,
     resolve_plain_dotenv_path,
@@ -245,6 +247,13 @@ class MainWindow(QMainWindow):
         )
         enc_btn.clicked.connect(self._encrypt_env)
         bar.addWidget(enc_btn)
+        edit_btn = QPushButton("Edit configuration…")
+        edit_btn.setToolTip(
+            "Edit streams, Hikvision URL builder, playback options, and .env. "
+            "Playback (viewer:) changes need an app restart to apply fully."
+        )
+        edit_btn.clicked.connect(self._edit_configuration)
+        bar.addWidget(edit_btn)
         outer.addLayout(bar)
 
         self._scroll = QScrollArea()
@@ -261,6 +270,12 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._scroll, stretch=1)
 
         self._reload()
+
+    def _edit_configuration(self) -> None:
+        path = resolve_config_path()
+        saved, _viewer_changed = open_config_editor(self, path)
+        if saved:
+            self._reload()
 
     def _mode_hint(self) -> str:
         if self._subprocess:
@@ -353,6 +368,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    apply_viewer_from_yaml(resolve_config_path())
     _apply_qt_platform_for_wid_embed()
     _strip_wayland_so_mpv_uses_x11()
     app = QApplication(sys.argv)
