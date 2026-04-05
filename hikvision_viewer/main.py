@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import shutil
 import sys
@@ -33,6 +34,31 @@ from hikvision_viewer.config_loader import (
     resolve_plain_dotenv_path,
 )
 from hikvision_viewer.env_secure import KeyringError, encrypt_dotenv_move_plain
+
+
+def _viewer_state_path():
+    return app_config_dir() / "viewer_state.json"
+
+
+def _load_viewer_state() -> dict:
+    path = _viewer_state_path()
+    try:
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_viewer_state_file(data: dict) -> None:
+    path = _viewer_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _env_flag(name: str, default: str) -> bool:
@@ -236,7 +262,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 720)
         self._tiles: list[StreamTile] = []
         self._subprocess = _use_mpv_subprocess()
-        self._single_view = False
+        self._viewer_state = _load_viewer_state()
+        self._single_view = bool(self._viewer_state.get("single_view"))
         self._single_index = 0
         self._status_base = ""
 
@@ -402,8 +429,23 @@ class MainWindow(QMainWindow):
         self._single_view = single
         self._sync_view_buttons()
         self._place_tiles_for_current_mode()
-        self._refresh_status_text()
         QTimer.singleShot(0, self._refresh_tiles)
+
+    def _persist_viewer_state(self) -> None:
+        stream: str | None = None
+        if self._tiles:
+            if self._single_view and self._stack.count():
+                i = self._stack.currentIndex()
+                if 0 <= i < len(self._tiles):
+                    stream = self._tiles[i].stream_name
+            elif 0 <= self._single_index < len(self._tiles):
+                stream = self._tiles[self._single_index].stream_name
+        data = {
+            "last_single_stream": stream,
+            "single_view": bool(self._single_view),
+        }
+        _save_viewer_state_file(data)
+        self._viewer_state = data
 
     def _detach_tiles_from_layouts(self) -> None:
         while self._grid.count():
@@ -416,36 +458,45 @@ class MainWindow(QMainWindow):
             self._stack.removeWidget(w)
 
     def _place_tiles_for_current_mode(self) -> None:
-        self._detach_tiles_from_layouts()
-        if not self._tiles:
-            self._scroll.setVisible(True)
-            self._stack.setVisible(False)
-            self._update_nav_buttons()
-            self._update_view_toolbar_visibility()
-            return
-        if self._single_view:
-            for t in self._tiles:
-                self._stack.addWidget(t)
-            n = len(self._tiles)
-            idx = min(max(self._single_index, 0), n - 1)
-            self._stack.setCurrentIndex(idx)
-            self._single_index = idx
-            self._scroll.setVisible(False)
-            self._stack.setVisible(True)
-        else:
-            cols = 2 if len(self._tiles) <= 4 else 3
-            for i, t in enumerate(self._tiles):
-                r, c = divmod(i, cols)
-                self._grid.addWidget(t, r, c)
-            # QStackedWidget hides non-current pages; those widgets stay hidden when reparented.
-            for t in self._tiles:
-                t.show()
-            self._grid_host.updateGeometry()
-            self._scroll.updateGeometry()
-            self._scroll.setVisible(True)
-            self._stack.setVisible(False)
+        # Reparenting emits currentChanged for each removeWidget(0); that used to clobber
+        # _single_index before we could persist the camera chosen in Single view.
+        self._stack.blockSignals(True)
+        try:
+            self._detach_tiles_from_layouts()
+            if not self._tiles:
+                self._scroll.setVisible(True)
+                self._stack.setVisible(False)
+            elif self._single_view:
+                for t in self._tiles:
+                    self._stack.addWidget(t)
+                n = len(self._tiles)
+                idx = min(max(self._single_index, 0), n - 1)
+                self._stack.setCurrentIndex(idx)
+                self._single_index = idx
+                self._scroll.setVisible(False)
+                self._stack.setVisible(True)
+            else:
+                cols = 2 if len(self._tiles) <= 4 else 3
+                for i, t in enumerate(self._tiles):
+                    r, c = divmod(i, cols)
+                    self._grid.addWidget(t, r, c)
+                # QStackedWidget hides non-current pages; those widgets stay hidden when reparented.
+                for t in self._tiles:
+                    t.show()
+                self._grid_host.updateGeometry()
+                self._scroll.updateGeometry()
+                self._scroll.setVisible(True)
+                self._stack.setVisible(False)
+        finally:
+            self._stack.blockSignals(False)
+
+        if self._single_view and self._stack.count():
+            self._single_index = self._stack.currentIndex()
+
         self._update_nav_buttons()
         self._update_view_toolbar_visibility()
+        self._refresh_status_text()
+        self._persist_viewer_state()
 
     def _update_nav_buttons(self) -> None:
         en = self._single_view and len(self._tiles) > 1
@@ -465,9 +516,10 @@ class MainWindow(QMainWindow):
             self._btn_next.setVisible(False)
 
     def _on_stack_index_changed(self, index: int) -> None:
-        if index >= 0:
+        if self._single_view and index >= 0:
             self._single_index = index
         self._refresh_status_text()
+        self._persist_viewer_state()
 
     def _single_next(self) -> None:
         if not self._single_view or len(self._tiles) < 2:
@@ -486,10 +538,13 @@ class MainWindow(QMainWindow):
             return
         if self._single_view and self._tiles:
             i = self._stack.currentIndex()
-            name = self._tiles[i].stream_name
-            self._status.setText(
-                f"{i + 1}/{len(self._tiles)} — {name}  |  {self._status_base}"
-            )
+            if 0 <= i < len(self._tiles):
+                name = self._tiles[i].stream_name
+                self._status.setText(
+                    f"{i + 1}/{len(self._tiles)} — {name}  |  {self._status_base}"
+                )
+            else:
+                self._status.setText(self._status_base)
         else:
             self._status.setText(self._status_base)
 
@@ -577,17 +632,20 @@ class MainWindow(QMainWindow):
 
         if prev_name in names:
             self._single_index = names.index(prev_name)
-        elif names:
-            self._single_index = min(self._single_index, len(names) - 1)
         else:
-            self._single_index = 0
+            persisted = self._viewer_state.get("last_single_stream")
+            if isinstance(persisted, str) and persisted in names:
+                self._single_index = names.index(persisted)
+            elif names:
+                self._single_index = min(self._single_index, len(names) - 1)
+            else:
+                self._single_index = 0
 
         hw = _mpv_hwdec()
         self._status_base = (
             f"{len(names)} streams — {path} — {self._mode_hint()} hwdec={hw}"
         )
         self._place_tiles_for_current_mode()
-        self._refresh_status_text()
         QTimer.singleShot(0, self._refresh_tiles)
 
     def _refresh_tiles(self) -> None:
@@ -596,6 +654,7 @@ class MainWindow(QMainWindow):
             t.repaint()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._persist_viewer_state()
         self._clear_grid()
         super().closeEvent(event)
 
