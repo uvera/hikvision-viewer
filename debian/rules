@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME = hikvision_viewer
+export PYBUILD_DESTDIR_python3 = debian/hikvision-viewer/
+# No upstream test suite wired for pybuild yet.
+export PYBUILD_DISABLE = test
+
+%:
+	dh $@ --buildsystem=pybuild

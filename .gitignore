@@ -9,6 +9,15 @@ dist/
 .env.enc
 config.yaml
 
+# Debian package build
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/*.debhelper
+debian/hikvision-viewer/
+
 # AUR / makepkg (build under aur/)
 aur/pkg/
 aur/src/
