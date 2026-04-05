@@ -5,16 +5,21 @@ import sys
 
 import mpv
 from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -116,6 +121,10 @@ class StreamTile(QWidget):
         self._surface.setMinimumSize(280, 158)
         self._surface.setStyleSheet("background: #000;")
         layout.addWidget(self._surface, stretch=1)
+
+    @property
+    def stream_name(self) -> str:
+        return self._title
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -227,6 +236,9 @@ class MainWindow(QMainWindow):
         self.resize(1280, 720)
         self._tiles: list[StreamTile] = []
         self._subprocess = _use_mpv_subprocess()
+        self._single_view = False
+        self._single_index = 0
+        self._status_base = ""
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -237,23 +249,58 @@ class MainWindow(QMainWindow):
         self._status.setStyleSheet("color: #888;")
         bar.addWidget(self._status)
         bar.addStretch()
-        reload_btn = QPushButton("Reload config")
-        reload_btn.clicked.connect(self._reload)
-        bar.addWidget(reload_btn)
-        enc_btn = QPushButton("Encrypt env…")
-        enc_btn.setToolTip(
+
+        self._btn_grid = QPushButton("Grid")
+        self._btn_grid.setCheckable(True)
+        self._btn_single = QPushButton("Single")
+        self._btn_single.setCheckable(True)
+        self._view_group = QButtonGroup(self)
+        self._view_group.addButton(self._btn_grid, 0)
+        self._view_group.addButton(self._btn_single, 1)
+        self._btn_grid.setChecked(True)
+        self._btn_grid.clicked.connect(lambda: self._set_single_view(False))
+        self._btn_single.clicked.connect(lambda: self._set_single_view(True))
+        bar.addWidget(self._btn_grid)
+        bar.addWidget(self._btn_single)
+
+        self._btn_prev = QPushButton("Prev")
+        self._btn_prev.setToolTip("Previous camera (Single view); Left/Up")
+        self._btn_prev.clicked.connect(self._single_prev)
+        bar.addWidget(self._btn_prev)
+        self._btn_next = QPushButton("Next")
+        self._btn_next.setToolTip("Next camera (Single view); Right/Down")
+        self._btn_next.clicked.connect(self._single_next)
+        bar.addWidget(self._btn_next)
+
+        fs_btn = QPushButton("Fullscreen")
+        fs_btn.setToolTip("Toggle fullscreen (F11)")
+        fs_btn.clicked.connect(self._toggle_fullscreen)
+        bar.addWidget(fs_btn)
+
+        settings_btn = QToolButton()
+        settings_btn.setText("Settings")
+        settings_btn.setToolTip("Configuration and environment")
+        settings_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        settings_menu = QMenu(settings_btn)
+        act_reload = QAction("Reload config", self)
+        act_reload.triggered.connect(self._reload)
+        settings_menu.addAction(act_reload)
+        act_encrypt = QAction("Encrypt env…", self)
+        act_encrypt.setToolTip(
             "Move plaintext .env to .env.enc using the OS keyring (Secret Service / "
             "Keychain / Credential Manager) to hold the encryption key."
         )
-        enc_btn.clicked.connect(self._encrypt_env)
-        bar.addWidget(enc_btn)
-        edit_btn = QPushButton("Edit configuration…")
-        edit_btn.setToolTip(
+        act_encrypt.triggered.connect(self._encrypt_env)
+        settings_menu.addAction(act_encrypt)
+        act_edit = QAction("Edit configuration…", self)
+        act_edit.setToolTip(
             "Edit streams, Hikvision URL builder, playback options, and .env. "
             "Playback (viewer:) changes need an app restart to apply fully."
         )
-        edit_btn.clicked.connect(self._edit_configuration)
-        bar.addWidget(edit_btn)
+        act_edit.triggered.connect(self._edit_configuration)
+        settings_menu.addAction(act_edit)
+        settings_btn.setMenu(settings_menu)
+        bar.addWidget(settings_btn)
         outer.addLayout(bar)
 
         self._scroll = QScrollArea()
@@ -269,6 +316,16 @@ class MainWindow(QMainWindow):
         self._scroll.setWidget(self._grid_host)
         outer.addWidget(self._scroll, stretch=1)
 
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background: #111;")
+        self._stack.currentChanged.connect(self._on_stack_index_changed)
+        outer.addWidget(self._stack, stretch=1)
+        self._stack.hide()
+
+        self._setup_shortcuts()
+        self._update_view_toolbar_visibility()
+        self._update_nav_buttons()
+
         self._reload()
 
     def _edit_configuration(self) -> None:
@@ -282,6 +339,160 @@ class MainWindow(QMainWindow):
             return "mpv subprocess"
         return "libmpv"
 
+    def _setup_shortcuts(self) -> None:
+        ctx = Qt.ShortcutContext.WindowShortcut
+
+        sc_r = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        sc_r.setContext(ctx)
+        sc_r.activated.connect(self._single_next)
+        sc_d = QShortcut(QKeySequence(Qt.Key.Key_Down), self)
+        sc_d.setContext(ctx)
+        sc_d.activated.connect(self._single_next)
+        sc_l = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        sc_l.setContext(ctx)
+        sc_l.activated.connect(self._single_prev)
+        sc_u = QShortcut(QKeySequence(Qt.Key.Key_Up), self)
+        sc_u.setContext(ctx)
+        sc_u.activated.connect(self._single_prev)
+
+        sc_g = QShortcut(QKeySequence(Qt.Key.Key_G), self)
+        sc_g.setContext(ctx)
+        sc_g.activated.connect(self._toggle_single_view_shortcut)
+
+        sc_f11 = QShortcut(QKeySequence("F11"), self)
+        sc_f11.setContext(ctx)
+        sc_f11.activated.connect(self._toggle_fullscreen)
+
+        self._shortcut_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._shortcut_esc.setContext(ctx)
+        self._shortcut_esc.activated.connect(self._exit_fullscreen_if_needed)
+
+    def _toggle_single_view_shortcut(self) -> None:
+        if not self._tiles:
+            return
+        self._set_single_view(not self._single_view)
+
+    def _exit_fullscreen_if_needed(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _sync_view_buttons(self) -> None:
+        self._btn_grid.blockSignals(True)
+        self._btn_single.blockSignals(True)
+        self._btn_grid.setChecked(not self._single_view)
+        self._btn_single.setChecked(self._single_view)
+        self._btn_grid.blockSignals(False)
+        self._btn_single.blockSignals(False)
+
+    def _set_single_view(self, single: bool) -> None:
+        if not self._tiles:
+            return
+        if single == self._single_view:
+            self._sync_view_buttons()
+            self._update_view_toolbar_visibility()
+            return
+        if self._single_view and self._stack.count():
+            self._single_index = self._stack.currentIndex()
+        self._single_view = single
+        self._sync_view_buttons()
+        self._place_tiles_for_current_mode()
+        self._refresh_status_text()
+        QTimer.singleShot(0, self._refresh_tiles)
+
+    def _detach_tiles_from_layouts(self) -> None:
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        while self._stack.count():
+            w = self._stack.widget(0)
+            self._stack.removeWidget(w)
+
+    def _place_tiles_for_current_mode(self) -> None:
+        self._detach_tiles_from_layouts()
+        if not self._tiles:
+            self._scroll.setVisible(True)
+            self._stack.setVisible(False)
+            self._update_nav_buttons()
+            self._update_view_toolbar_visibility()
+            return
+        if self._single_view:
+            for t in self._tiles:
+                self._stack.addWidget(t)
+            n = len(self._tiles)
+            idx = min(max(self._single_index, 0), n - 1)
+            self._stack.setCurrentIndex(idx)
+            self._single_index = idx
+            self._scroll.setVisible(False)
+            self._stack.setVisible(True)
+        else:
+            cols = 2 if len(self._tiles) <= 4 else 3
+            for i, t in enumerate(self._tiles):
+                r, c = divmod(i, cols)
+                self._grid.addWidget(t, r, c)
+            # QStackedWidget hides non-current pages; those widgets stay hidden when reparented.
+            for t in self._tiles:
+                t.show()
+            self._grid_host.updateGeometry()
+            self._scroll.updateGeometry()
+            self._scroll.setVisible(True)
+            self._stack.setVisible(False)
+        self._update_nav_buttons()
+        self._update_view_toolbar_visibility()
+
+    def _update_nav_buttons(self) -> None:
+        en = self._single_view and len(self._tiles) > 1
+        self._btn_prev.setEnabled(en)
+        self._btn_next.setEnabled(en)
+
+    def _update_view_toolbar_visibility(self) -> None:
+        if self._single_view:
+            self._btn_grid.setVisible(True)
+            self._btn_single.setVisible(False)
+            self._btn_prev.setVisible(True)
+            self._btn_next.setVisible(True)
+        else:
+            self._btn_grid.setVisible(False)
+            self._btn_single.setVisible(True)
+            self._btn_prev.setVisible(False)
+            self._btn_next.setVisible(False)
+
+    def _on_stack_index_changed(self, index: int) -> None:
+        if index >= 0:
+            self._single_index = index
+        self._refresh_status_text()
+
+    def _single_next(self) -> None:
+        if not self._single_view or len(self._tiles) < 2:
+            return
+        i = self._stack.currentIndex()
+        self._stack.setCurrentIndex((i + 1) % len(self._tiles))
+
+    def _single_prev(self) -> None:
+        if not self._single_view or len(self._tiles) < 2:
+            return
+        i = self._stack.currentIndex()
+        self._stack.setCurrentIndex((i - 1) % len(self._tiles))
+
+    def _refresh_status_text(self) -> None:
+        if not self._status_base:
+            return
+        if self._single_view and self._tiles:
+            i = self._stack.currentIndex()
+            name = self._tiles[i].stream_name
+            self._status.setText(
+                f"{i + 1}/{len(self._tiles)} — {name}  |  {self._status_base}"
+            )
+        else:
+            self._status.setText(self._status_base)
+
     def _clear_grid(self) -> None:
         for t in self._tiles:
             t.shutdown()
@@ -290,6 +501,10 @@ class MainWindow(QMainWindow):
             item = self._grid.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        while self._stack.count():
+            w = self._stack.widget(0)
+            self._stack.removeWidget(w)
+            w.deleteLater()
 
     def _encrypt_env(self) -> None:
         cfg = resolve_config_path()
@@ -327,34 +542,52 @@ class MainWindow(QMainWindow):
     def _reload(self) -> None:
         path = resolve_config_path()
         self._subprocess = _use_mpv_subprocess()
+
+        prev_name: str | None = None
+        if self._single_view and self._stack.count():
+            cw = self._stack.currentWidget()
+            if isinstance(cw, StreamTile):
+                prev_name = cw.stream_name
+        elif self._tiles and 0 <= self._single_index < len(self._tiles):
+            prev_name = self._tiles[self._single_index].stream_name
+
         self._clear_grid()
         if not path.is_file():
             cfg_dir = app_config_dir()
+            self._status_base = ""
             self._status.setText(
                 f"No config — create {path} (optional secrets in {cfg_dir / '.env'} or .env.enc)"
             )
+            self._place_tiles_for_current_mode()
             return
         try:
             streams = load_streams(path)
         except Exception as e:
+            self._status_base = ""
             self._status.setText(f"Config error: {e}")
             QMessageBox.warning(self, "Config", str(e))
+            self._place_tiles_for_current_mode()
             return
 
         names = sorted(streams.keys())
-        cols = 2 if len(names) <= 4 else 3
-        for i, name in enumerate(names):
+        for name in names:
             url = streams[name]
             tile = StreamTile(name, url, subprocess=self._subprocess)
-            r, c = divmod(i, cols)
-            self._grid.addWidget(tile, r, c)
             self._tiles.append(tile)
 
+        if prev_name in names:
+            self._single_index = names.index(prev_name)
+        elif names:
+            self._single_index = min(self._single_index, len(names) - 1)
+        else:
+            self._single_index = 0
+
         hw = _mpv_hwdec()
-        self._status.setText(
+        self._status_base = (
             f"{len(names)} streams — {path} — {self._mode_hint()} hwdec={hw}"
         )
-
+        self._place_tiles_for_current_mode()
+        self._refresh_status_text()
         QTimer.singleShot(0, self._refresh_tiles)
 
     def _refresh_tiles(self) -> None:
