@@ -4,8 +4,9 @@
 # button to move .env → .env.enc; the OS keyring holds the Fernet key (Secret Service / Keychain).
 # {ENV_VAR} is substituted from the environment after loading those files.
 #
-# Viewer env (optional): HIKVISION_MPV_SUBPROCESS=1 (default) uses one mpv process per
-# tile (more stable than embedded libmpv). HIKVISION_MPV_HWDEC=no (default) avoids many
+# Viewer env (optional): HIKVISION_MPV_SUBPROCESS=1 (default on normal installs) uses one mpv
+# process per tile (needs `mpv` on PATH). AppImage/PyInstaller defaults to 0 (bundled libmpv).
+# HIKVISION_MPV_HWDEC=no (default) avoids many
 # multi-stream GPU crashes; set to auto for hardware decode. HIKVISION_MPV_VO=gpu.
 # On Wayland, Qt uses xcb (XWayland) and WAYLAND_DISPLAY is unset for this process so each
 # mpv child also uses X11 and honors --wid (otherwise mpv opens separate Wayland windows).

@@ -76,7 +76,9 @@ def _mpv_vo() -> str:
 
 
 def _use_mpv_subprocess() -> bool:
-    return _env_flag("HIKVISION_MPV_SUBPROCESS", "1")
+    # PyInstaller/AppImage ships libmpv, not the `mpv` binary; subprocess mode needs mpv on PATH.
+    default = "0" if getattr(sys, "frozen", False) else "1"
+    return _env_flag("HIKVISION_MPV_SUBPROCESS", default)
 
 
 def _force_dark_mode() -> bool:

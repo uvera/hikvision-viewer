@@ -23,3 +23,9 @@ aur/pkg/
 aur/src/
 aur/*.pkg.tar.*
 aur/*.sig
+
+# AppImage / linuxdeploy
+AppDir/
+tools/linuxdeploy*.AppImage
+tools/appimagetool*.AppImage
+*.AppImage
