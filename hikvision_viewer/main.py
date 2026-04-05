@@ -30,6 +30,7 @@ from hikvision_viewer.config_loader import (
     app_config_dir,
     apply_viewer_from_yaml,
     load_streams,
+    ordered_stream_names,
     resolve_config_path,
     resolve_plain_dotenv_path,
 )
@@ -624,7 +625,7 @@ class MainWindow(QMainWindow):
             self._place_tiles_for_current_mode()
             return
 
-        names = sorted(streams.keys())
+        names = ordered_stream_names(path, streams)
         for name in names:
             url = streams[name]
             tile = StreamTile(name, url, subprocess=self._subprocess)

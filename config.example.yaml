@@ -18,6 +18,11 @@
 #   mpv_hwdec: "no"
 #   mpv_vo: "gpu"
 #   qt_wayland: false
+#   # Optional: Prev/Next order in Single view (and tile order in Grid). Omitted streams append sorted.
+#   single_view_order:
+#     - gate
+#     - front_yard
+#     - side_enterance
 streams:
   side_enterance:
     url: rtsp://admin:{CAM_SIDE_ENTERANCE_PASSWORD}@{CAM_SIDE_ENTERANCE_IP}:554/Streaming/Channels/101

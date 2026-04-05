@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 from hikvision_viewer.config_loader import (
     app_config_dir,
     load_config_document,
+    ordered_stream_names,
     parse_streams_raw,
     resolve_plain_dotenv_path,
     save_config_document,
@@ -81,20 +82,22 @@ class ConfigEditorDialog(QDialog):
         self.resize(920, 640)
 
         root = QVBoxLayout(self)
-        tabs = QTabWidget()
-        root.addWidget(tabs)
+        self._tabs = QTabWidget()
+        root.addWidget(self._tabs)
 
         self._streams_tab = QWidget()
-        tabs.addTab(self._streams_tab, "Streams")
+        self._tabs.addTab(self._streams_tab, "Streams")
         self._build_streams_tab()
 
         self._playback_tab = QWidget()
-        tabs.addTab(self._playback_tab, "Playback")
+        self._tabs.addTab(self._playback_tab, "Playback")
         self._build_playback_tab()
 
         self._env_tab = QWidget()
-        tabs.addTab(self._env_tab, "Environment")
+        self._tabs.addTab(self._env_tab, "Environment")
         self._build_env_tab()
+
+        self._tabs.currentChanged.connect(self._on_main_tab_changed)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -257,6 +260,25 @@ class ConfigEditorDialog(QDialog):
         hint.setStyleSheet("color: #888;")
         fl.addWidget(hint)
         lay.addWidget(box)
+
+        order_box = QGroupBox(
+            "Single view camera order (Prev/Next, saved as viewer.single_view_order)"
+        )
+        ol = QVBoxLayout(order_box)
+        order_hint = QLabel(
+            "Drag items to set cycle order. Missing or new streams are appended "
+            "alphabetically when you save. Switch to this tab to refresh the list "
+            "after renaming streams."
+        )
+        order_hint.setWordWrap(True)
+        order_hint.setStyleSheet("color: #888;")
+        ol.addWidget(order_hint)
+        self._pb_order_list = QListWidget()
+        self._pb_order_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._pb_order_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._pb_order_list.setMinimumHeight(160)
+        ol.addWidget(self._pb_order_list)
+        lay.addWidget(order_box)
         lay.addStretch()
 
     def _build_env_tab(self) -> None:
@@ -330,6 +352,43 @@ class ConfigEditorDialog(QDialog):
 
         self._loading_ui = False
         self._viewer_changed = False
+        self._refresh_single_view_order_list()
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        w = self._tabs.widget(index)
+        if w is not None and w is self._playback_tab:
+            self._refresh_single_view_order_list()
+
+    def _refresh_single_view_order_list(self) -> None:
+        idx = self._current_row_index()
+        if idx >= 0:
+            self._sync_ui_to_row(idx)
+        streams_map: dict[str, str] = {}
+        for r in self._rows:
+            n = r.name.strip()
+            if n:
+                streams_map[n] = ""
+        self._pb_order_list.clear()
+        if not streams_map:
+            return
+        for n in ordered_stream_names(self._config_path, streams_map):
+            self._pb_order_list.addItem(QListWidgetItem(n))
+
+    def _single_view_order_for_save(self, stream_keys: set[str]) -> list[str]:
+        out: list[str] = []
+        for i in range(self._pb_order_list.count()):
+            it = self._pb_order_list.item(i)
+            if it is None:
+                continue
+            t = it.text().strip()
+            if t in stream_keys and t not in out:
+                out.append(t)
+        for n in sorted(stream_keys):
+            if n not in out:
+                out.append(n)
+        return out
 
     def _first_existing_env_enc(self) -> Path | None:
         for base in (self._config_path.parent, app_config_dir()):
@@ -552,12 +611,13 @@ class ConfigEditorDialog(QDialog):
             out[name] = url
         return out
 
-    def _viewer_dict_from_ui(self) -> dict:
+    def _viewer_dict_from_ui(self, stream_keys: set[str]) -> dict:
         return {
             "mpv_subprocess": self._pb_sub.isChecked(),
             "mpv_hwdec": self._pb_hwdec.currentText().strip() or "no",
             "mpv_vo": self._pb_vo.text().strip() or "gpu",
             "qt_wayland": self._pb_wayland.isChecked(),
+            "single_view_order": self._single_view_order_for_save(stream_keys),
         }
 
     def _on_save(self) -> None:
@@ -572,7 +632,7 @@ class ConfigEditorDialog(QDialog):
 
         data = load_config_document(self._config_path)
         data["streams"] = streams_to_yaml_entries(streams)
-        viewer = self._viewer_dict_from_ui()
+        viewer = self._viewer_dict_from_ui(set(streams.keys()))
         data["viewer"] = viewer
         self._viewer_changed = viewer != (self._initial_viewer_yaml or {})
 

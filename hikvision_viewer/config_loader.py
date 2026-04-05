@@ -93,6 +93,33 @@ def expand_env(value: str) -> str:
     return _PLACEHOLDER.sub(repl, value)
 
 
+def ordered_stream_names(config_path: Path, streams: dict[str, str]) -> list[str]:
+    """Stream names for tile/stack order: viewer.single_view_order first, then sorted remainder."""
+    names = set(streams.keys())
+    if not names:
+        return []
+    raw_order: list[str] = []
+    if config_path.is_file():
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            viewer = data.get("viewer")
+            if isinstance(viewer, dict):
+                order = viewer.get("single_view_order")
+                if isinstance(order, list):
+                    raw_order = [str(x) for x in order if isinstance(x, str) and x.strip()]
+        except (OSError, yaml.YAMLError):
+            raw_order = []
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in raw_order:
+        if n in names and n not in seen:
+            out.append(n)
+            seen.add(n)
+    for n in sorted(names - seen):
+        out.append(n)
+    return out
+
+
 def load_streams(config_path: Path) -> dict[str, str]:
     _apply_dotenv(config_path)
     data = yaml.safe_load(config_path.read_text())
