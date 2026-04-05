@@ -5,7 +5,7 @@ import shutil
 import sys
 
 import mpv
-from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer
+from PyQt6.QtCore import QProcess, QProcessEnvironment, QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -183,7 +184,21 @@ class StreamTile(QWidget):
         layout.setSpacing(4)
         self._label = QLabel(title)
         self._label.setStyleSheet("color: #ccc; font-size: 12px;")
-        layout.addWidget(self._label)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+        header.addWidget(self._label, stretch=1)
+        self._mute_btn: QToolButton | None = None
+        if not subprocess:
+            self._mute_btn = QToolButton()
+            self._mute_btn.setAutoRaise(True)
+            self._mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self._mute_btn.setIconSize(QSize(20, 20))
+            self._mute_btn.setEnabled(False)
+            self._mute_btn.clicked.connect(self._toggle_libmpv_mute)
+            self._sync_mute_button()
+            header.addWidget(self._mute_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(header)
 
         self._surface = QWidget()
         self._surface.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
@@ -283,6 +298,37 @@ class StreamTile(QWidget):
             opts["gpu_context"] = "x11egl"
         self._player = mpv.MPV(**opts)
         self._player.play(self._url)
+        if self._mute_btn is not None:
+            self._mute_btn.setEnabled(True)
+            self._sync_mute_button()
+
+    def _sync_mute_button(self) -> None:
+        if self._mute_btn is None:
+            return
+        style = self.style()
+        muted = True
+        if self._player is not None:
+            try:
+                muted = bool(self._player.mute)
+            except Exception:
+                muted = True
+        if muted:
+            self._mute_btn.setIcon(
+                style.standardIcon(QStyle.StandardPixmap.SP_MediaVolumeMuted)
+            )
+            self._mute_btn.setToolTip("Unmute")
+        else:
+            self._mute_btn.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+            self._mute_btn.setToolTip("Mute")
+
+    def _toggle_libmpv_mute(self) -> None:
+        if self._player is None:
+            return
+        try:
+            self._player.mute = not bool(self._player.mute)
+        except Exception:
+            return
+        self._sync_mute_button()
 
     def shutdown(self) -> None:
         if self._proc is not None:
@@ -293,6 +339,8 @@ class StreamTile(QWidget):
                     self._proc.waitForFinished(1500)
             self._proc.deleteLater()
             self._proc = None
+        if self._mute_btn is not None:
+            self._mute_btn.setEnabled(False)
         if self._player is not None:
             try:
                 self._player.terminate()
