@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import json
+import locale
 import os
 import shutil
+import socket
 import sys
+import tempfile
 
 import mpv
-from PyQt6.QtCore import QProcess, QProcessEnvironment, QSize, Qt, QTimer
+from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -86,6 +89,15 @@ def _force_dark_mode() -> bool:
     return _env_flag("HIKVISION_FORCE_DARK", "0")
 
 
+def _mpv_debug_enabled() -> bool:
+    return _env_flag("HIKVISION_DEBUG_MPV", "0")
+
+
+def _log_mpv(msg: str) -> None:
+    if _mpv_debug_enabled():
+        print(f"[hikvision-viewer mpv] {msg}", file=sys.stderr, flush=True)
+
+
 def _apply_fusion_dark_palette(app: QApplication) -> None:
     """Dark Fusion palette (ignores system light theme for Qt widgets)."""
     palette = QPalette()
@@ -164,6 +176,250 @@ def _mpv_subprocess_environment() -> QProcessEnvironment:
 _LAVF_RECONNECT = "reconnect_streamed=1,reconnect_delay_max=5"
 
 
+def _mpv_ipc_payload(name: str, value: object) -> bytes:
+    # Minified JSON; mpv requires a single line terminated by \n (see DOCS/man/ipc.rst).
+    line = json.dumps(
+        {"command": ["set_property", name, value]}, separators=(",", ":")
+    ) + "\n"
+    return line.encode("utf-8")
+
+
+def _mpv_ipc_line_looks_like_command_reply(text: str) -> bool:
+    """mpv may emit {"event":...} lines before {"error":"success",...} command replies."""
+    t = text.strip()
+    if not t or t.startswith("#"):
+        return False
+    try:
+        obj = json.loads(t)
+    except json.JSONDecodeError:
+        return False
+    return "error" in obj
+
+
+def _mpv_ipc_read_command_reply_unix(client: socket.socket) -> str:
+    """Read lines until a JSON command reply (has 'error'); skip event/property-change lines."""
+    buf = b""
+    chunk: bytes = b""
+    try:
+        while True:
+            while b"\n" not in buf:
+                chunk = client.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 262144:
+                    break
+            while b"\n" in buf:
+                line, _, buf = buf.partition(b"\n")
+                text = line.decode("utf-8", errors="replace").strip()
+                if _mpv_ipc_line_looks_like_command_reply(text):
+                    return text[:800]
+            if not chunk:
+                break
+    except OSError as e:
+        return f"<read error: {e}>"
+    return ""
+
+
+def _mpv_ipc_read_command_reply_pipe(pipe, buf: bytearray) -> str:
+    while True:
+        while b"\n" not in buf:
+            chunk = pipe.read(8192)
+            if not chunk:
+                return ""
+            buf.extend(chunk)
+            if len(buf) > 262144:
+                return ""
+        while b"\n" in buf:
+            idx = buf.find(b"\n")
+            line = bytes(buf[:idx])
+            del buf[: idx + 1]
+            text = line.decode("utf-8", errors="replace").strip()
+            if _mpv_ipc_line_looks_like_command_reply(text):
+                return text[:800]
+
+
+def _mpv_ipc_send_unix(socket_path: str, data: bytes) -> tuple[bool, str]:
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.35)
+        client.connect(socket_path)
+        client.sendall(data)
+        reply = _mpv_ipc_read_command_reply_unix(client)
+        client.close()
+        return True, reply
+    except OSError as e:
+        return False, str(e)
+
+
+def _mpv_ipc_send_win32(pipe_path: str, data: bytes) -> tuple[bool, str]:
+    """mpv on Windows uses a named pipe (see --input-ipc-server=\\\\.\\pipe\\...)."""
+    try:
+        with open(pipe_path, "r+b", buffering=0) as pipe:
+            pipe.write(data)
+            buf = bytearray()
+            reply = _mpv_ipc_read_command_reply_pipe(pipe, buf)
+            return True, reply
+    except OSError as e:
+        return False, str(e)
+
+
+def _mpv_ipc_set_property(
+    ipc_path: str, name: str, value: object, *, stream: str = ""
+) -> None:
+    """Best-effort mpv JSON IPC: Unix domain socket (Linux/macOS) or named pipe (Windows)."""
+    if not ipc_path:
+        return
+    data = _mpv_ipc_payload(name, value)
+    label = f"{stream!r} " if stream else ""
+    _log_mpv(f"{label}ipc send {name}={value!r} ({len(data)} B) path={ipc_path!r}")
+    if sys.platform == "win32":
+        ok, detail = _mpv_ipc_send_win32(ipc_path, data)
+    else:
+        ok, detail = _mpv_ipc_send_unix(ipc_path, data)
+    if ok:
+        _log_mpv(f"{label}ipc recv {detail!r}")
+    else:
+        _log_mpv(f"{label}ipc FAILED: {detail!r}")
+
+
+def _mpv_ipc_set_both_mutes(ipc_path: str, stream: str, muted: bool) -> None:
+    """mute + ao-mute: RTSP/audio sometimes ignores mute alone (mpv issue #10328 area)."""
+    _mpv_ipc_set_property(ipc_path, "mute", muted, stream=stream)
+    _mpv_ipc_set_property(ipc_path, "ao-mute", muted, stream=stream)
+
+
+def _mpv_ipc_reply_ok(line: str) -> bool:
+    if not line or line.startswith(("<drain error", "<read error")):
+        return False
+    try:
+        return json.loads(line).get("error") == "success"
+    except json.JSONDecodeError:
+        return False
+
+
+def _mpv_parse_mute_reply_line(line: str) -> bool | None:
+    if not line or line.startswith(("<drain error", "<read error")):
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if obj.get("error") != "success":
+        return None
+    val = obj.get("data")
+    if isinstance(val, bool):
+        return val
+    return None
+
+
+def _mpv_ipc_get_mute_ao_pair(ipc_path: str, stream: str) -> tuple[bool | None, bool | None]:
+    """Read mute and ao-mute in one IPC session (one connection, two get_property round-trips)."""
+    if not ipc_path:
+        return None, None
+    get_m = (
+        json.dumps({"command": ["get_property", "mute"]}, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    get_ao = (
+        json.dumps({"command": ["get_property", "ao-mute"]}, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    label = f"{stream!r} " if stream else ""
+    try:
+        if sys.platform == "win32":
+            pbuf = bytearray()
+            with open(ipc_path, "r+b", buffering=0) as pipe:
+                pipe.write(get_m)
+                r1 = _mpv_ipc_read_command_reply_pipe(pipe, pbuf)
+                m = _mpv_parse_mute_reply_line(r1)
+                pipe.write(get_ao)
+                r2 = _mpv_ipc_read_command_reply_pipe(pipe, pbuf)
+                ao = _mpv_parse_mute_reply_line(r2)
+            return m, ao
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.35)
+        client.connect(ipc_path)
+        try:
+            client.sendall(get_m)
+            r1 = _mpv_ipc_read_command_reply_unix(client)
+            m = _mpv_parse_mute_reply_line(r1)
+            client.sendall(get_ao)
+            r2 = _mpv_ipc_read_command_reply_unix(client)
+            ao = _mpv_parse_mute_reply_line(r2)
+        finally:
+            client.close()
+        return m, ao
+    except OSError as e:
+        _log_mpv(f"{label}ipc get mute/ao-mute pair FAILED: {e!r}")
+        return None, None
+
+
+def _mpv_ipc_atomic_snapshot_mute_and_set_mute(ipc_path: str, stream: str) -> bool | None:
+    """One IPC session: read mute (for restore on show), then set mute true. Avoids lost set on some mpv builds."""
+    if not ipc_path:
+        return None
+    get_b = (
+        json.dumps({"command": ["get_property", "mute"]}, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    set_mute_b = _mpv_ipc_payload("mute", True)
+    set_ao_b = _mpv_ipc_payload("ao-mute", True)
+    label = f"{stream!r} " if stream else ""
+    snap: bool | None = None
+    try:
+        if sys.platform == "win32":
+            _log_mpv(
+                f"{label}ipc atomic hide: get mute + mute/ao-mute=true pipe={ipc_path!r}"
+            )
+            pbuf = bytearray()
+            with open(ipc_path, "r+b", buffering=0) as pipe:
+                pipe.write(get_b)
+                r1 = _mpv_ipc_read_command_reply_pipe(pipe, pbuf)
+                _log_mpv(f"{label}ipc atomic recv1 {r1!r}")
+                snap = _mpv_parse_mute_reply_line(r1)
+                pipe.write(set_mute_b)
+                r2 = _mpv_ipc_read_command_reply_pipe(pipe, pbuf)
+                _log_mpv(f"{label}ipc atomic recv2 {r2!r}")
+                if not _mpv_ipc_reply_ok(r2):
+                    pipe.write(set_mute_b)
+                    r2b = _mpv_ipc_read_command_reply_pipe(pipe, pbuf)
+                    _log_mpv(f"{label}ipc atomic recv2b retry {r2b!r}")
+                pipe.write(set_ao_b)
+                r3 = _mpv_ipc_read_command_reply_pipe(pipe, pbuf)
+                _log_mpv(f"{label}ipc atomic recv3 ao-mute {r3!r}")
+        else:
+            _log_mpv(
+                f"{label}ipc atomic hide: get mute + mute/ao-mute=true sock={ipc_path!r}"
+            )
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(0.45)
+            client.connect(ipc_path)
+            try:
+                client.sendall(get_b)
+                r1 = _mpv_ipc_read_command_reply_unix(client)
+                _log_mpv(f"{label}ipc atomic recv1 {r1!r}")
+                snap = _mpv_parse_mute_reply_line(r1)
+                client.sendall(set_mute_b)
+                r2 = _mpv_ipc_read_command_reply_unix(client)
+                _log_mpv(f"{label}ipc atomic recv2 {r2!r}")
+                if not _mpv_ipc_reply_ok(r2):
+                    client.sendall(set_mute_b)
+                    r2b = _mpv_ipc_read_command_reply_unix(client)
+                    _log_mpv(f"{label}ipc atomic recv2b retry {r2b!r}")
+                client.sendall(set_ao_b)
+                r3 = _mpv_ipc_read_command_reply_unix(client)
+                _log_mpv(f"{label}ipc atomic recv3 ao-mute {r3!r}")
+            finally:
+                client.close()
+    except OSError as e:
+        _log_mpv(f"{label}ipc atomic hide FAILED: {e!r}")
+    return snap
+
+
+class _LibmpvMuteBridge(QObject):
+    """mpv invokes key callbacks on its event thread; emit here so Qt delivers on the GUI thread."""
+
+    toggle_mute = pyqtSignal()
+
+
 class StreamTile(QWidget):
     """One camera: label + native surface. Drives mpv either via QProcess (default) or embedded libmpv."""
 
@@ -174,7 +430,16 @@ class StreamTile(QWidget):
         self._subprocess = subprocess
         self._player: mpv.MPV | None = None
         self._proc: QProcess | None = None
+        self._ipc_path: str | None = None
         self._started = False
+        self._audio_muted_by_user = True
+        self._mute_suppressed_single_stack = False
+        # mpv mute before we IPC-mute for stack hide; on show, unmute only if this was False (was audible).
+        self._mute_snapshot_before_stack_hide: bool | None = None
+        self._mute_needs_stack_hide_ipc_roundtrip = False
+        self._subprocess_mute_sync_timer: QTimer | None = None
+        self._libmpv_mute_bridge: _LibmpvMuteBridge | None = None
+        self._libmpv_m_key_binding: object | None = None
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(320, 200)
@@ -198,6 +463,11 @@ class StreamTile(QWidget):
             self._mute_btn.clicked.connect(self._toggle_libmpv_mute)
             self._sync_mute_button()
             header.addWidget(self._mute_btn, alignment=Qt.AlignmentFlag.AlignRight)
+            self._libmpv_mute_bridge = _LibmpvMuteBridge(self)
+            self._libmpv_mute_bridge.toggle_mute.connect(self._toggle_libmpv_mute)
+            sc_m = QShortcut(QKeySequence(Qt.Key.Key_M), self)
+            sc_m.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc_m.activated.connect(self._toggle_libmpv_mute)
         layout.addLayout(header)
 
         self._surface = QWidget()
@@ -245,9 +515,23 @@ class StreamTile(QWidget):
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.setProcessEnvironment(_mpv_subprocess_environment())
         hwdec, vo = _mpv_hwdec(), _mpv_vo()
+        if sys.platform == "win32":
+            ipc = rf"\\.\pipe\hikvision-viewer-mpv-{os.getpid()}-{id(self)}"
+        else:
+            ipc = os.path.join(
+                tempfile.gettempdir(),
+                f"hikvision-viewer-mpv-{os.getpid()}-{id(self)}.sock",
+            )
+            try:
+                os.unlink(ipc)
+            except OSError:
+                pass
+        self._ipc_path = ipc
+        ipc_args = [f"--input-ipc-server={ipc}"]
         args = [
             "--no-terminal",
             "--mute",
+            *ipc_args,
             "--keep-open=yes",
             f"--wid={wid}",
             "--rtsp-transport=tcp",
@@ -265,12 +549,39 @@ class StreamTile(QWidget):
             args.append("--gpu-context=x11egl")
         args.append(self._url)
         proc.finished.connect(self._on_proc_finished)
+        # Do not use errorOccurred(ProcessError): PyQt6 may fail converting the enum to Python
+        # (TypeError: unable to convert C++ 'QProcess::ProcessError'...). Slot takes no args; read
+        # error from the process (same as Qt allows for slots with fewer parameters than the signal).
         proc.errorOccurred.connect(self._on_proc_error)
+        proc.started.connect(self._on_subprocess_started)
         self._proc = proc
         proc.start(exe, args)
 
-    def _on_proc_error(self, err: QProcess.ProcessError) -> None:
-        self._label.setText(f"{self._title} (mpv start error: {err.name})")
+    def _on_proc_error(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            err = proc.error()
+        except Exception:
+            self._label.setText(f"{self._title} (mpv start error)")
+            return
+        # Compare to enum members without int() — int(ProcessError) can also throw on some PyQt6 builds.
+        if err == QProcess.ProcessError.FailedToStart:
+            detail = "failed to start"
+        elif err == QProcess.ProcessError.Crashed:
+            detail = "crashed"
+        elif err == QProcess.ProcessError.Timedout:
+            detail = "timed out"
+        elif err == QProcess.ProcessError.ReadError:
+            detail = "read error"
+        elif err == QProcess.ProcessError.WriteError:
+            detail = "write error"
+        elif err == QProcess.ProcessError.UnknownError:
+            detail = "unknown error"
+        else:
+            detail = "error"
+        self._label.setText(f"{self._title} (mpv start error: {detail})")
 
     def _on_proc_finished(self, code: int, status: QProcess.ExitStatus) -> None:
         if self._proc is None:
@@ -279,6 +590,137 @@ class StreamTile(QWidget):
             self._label.setText(f"{self._title} (mpv crashed)")
         elif code != 0:
             self._label.setText(f"{self._title} (mpv exited {code})")
+
+    def _on_subprocess_started(self) -> None:
+        QTimer.singleShot(100, self._subprocess_startup_audio_sync)
+        if self._subprocess_mute_sync_timer is None:
+            t = QTimer(self)
+            t.setInterval(350)
+            t.timeout.connect(self._subprocess_sync_mute_ao_if_diverged)
+            self._subprocess_mute_sync_timer = t
+        QTimer.singleShot(200, self._subprocess_start_mute_poll_timer)
+
+    def _subprocess_startup_audio_sync(self) -> None:
+        """CLI --mute can leave ao-mute out of sync until IPC sets both; fixes first unmute with no audio."""
+        if self._ipc_path is None or self._proc is None:
+            return
+        if self._proc.state() != QProcess.ProcessState.Running:
+            return
+        if self._mute_suppressed_single_stack:
+            return
+        if self._audio_muted_by_user:
+            _mpv_ipc_set_both_mutes(self._ipc_path, self._title, True)
+        self._apply_output_mute()
+
+    def _schedule_subprocess_unmute_reassert(self) -> None:
+        ipc, title = self._ipc_path, self._title
+        proc = self._proc
+
+        def retry() -> None:
+            if (
+                self._ipc_path != ipc
+                or self._proc is not proc
+                or proc is None
+                or proc.state() != QProcess.ProcessState.Running
+            ):
+                return
+            if self._mute_suppressed_single_stack or self._audio_muted_by_user:
+                return
+            _mpv_ipc_set_both_mutes(ipc, title, False)
+
+        QTimer.singleShot(150, retry)
+
+    def _subprocess_start_mute_poll_timer(self) -> None:
+        if self._subprocess_mute_sync_timer is None or self._proc is None:
+            return
+        if self._proc.state() != QProcess.ProcessState.Running:
+            return
+        self._subprocess_mute_sync_timer.start()
+
+    def _subprocess_sync_mute_ao_if_diverged(self) -> None:
+        """mpv key 'm' can flip mute but leave ao-mute stale; we almost never call _apply_output_mute for subprocess."""
+        if not self._subprocess or self._ipc_path is None or self._proc is None:
+            return
+        if self._proc.state() != QProcess.ProcessState.Running:
+            return
+        if self._mute_suppressed_single_stack:
+            return
+        m, ao = _mpv_ipc_get_mute_ao_pair(self._ipc_path, self._title)
+        if m is None or ao is None or m == ao:
+            return
+        if _mpv_debug_enabled():
+            _log_mpv(
+                f"{self._title!r} ipc mute/ao-mute diverged mute={m!r} ao-mute={ao!r} -> set both to {m!r}"
+            )
+        _mpv_ipc_set_both_mutes(self._ipc_path, self._title, m)
+
+    def _effective_audio_mute(self) -> bool:
+        return self._mute_suppressed_single_stack or self._audio_muted_by_user
+
+    def _apply_output_mute(self) -> None:
+        want = self._effective_audio_mute()
+        if self._player is not None:
+            try:
+                self._player.mute = want
+                self._player.ao_mute = want
+            except Exception:
+                pass
+            if _mpv_debug_enabled():
+                _log_mpv(
+                    f"{self._title!r} libmpv mute={want} "
+                    f"(user={self._audio_muted_by_user} stack_hide={self._mute_suppressed_single_stack})"
+                )
+        elif self._ipc_path and self._proc is not None:
+            if self._proc.state() != QProcess.ProcessState.Running:
+                if _mpv_debug_enabled():
+                    _log_mpv(f"{self._title!r} ipc skip: process not running")
+                return
+            # Subprocess: do not send mute=true on every visible refresh (overwrites mpv "m").
+            # Stack hide: IPC mute true. Stack show: IPC mute false only if mute was false before hide.
+            if self._mute_suppressed_single_stack:
+                if self._mute_needs_stack_hide_ipc_roundtrip:
+                    self._mute_needs_stack_hide_ipc_roundtrip = False
+                    self._mute_snapshot_before_stack_hide = (
+                        _mpv_ipc_atomic_snapshot_mute_and_set_mute(
+                            self._ipc_path, self._title
+                        )
+                    )
+                    if _mpv_debug_enabled():
+                        _log_mpv(
+                            f"{self._title!r} stack hide atomic done "
+                            f"snapshot={self._mute_snapshot_before_stack_hide!r}"
+                        )
+                # Second IPC: reinforce mute + ao-mute (hidden tiles may not get another apply).
+                _mpv_ipc_set_both_mutes(self._ipc_path, self._title, True)
+            elif self._mute_snapshot_before_stack_hide is not None:
+                snap = self._mute_snapshot_before_stack_hide
+                self._mute_snapshot_before_stack_hide = None
+                if snap is False:
+                    _mpv_ipc_set_both_mutes(self._ipc_path, self._title, False)
+                    self._schedule_subprocess_unmute_reassert()
+                elif _mpv_debug_enabled():
+                    _log_mpv(
+                        f"{self._title!r} stack show: keep mute (was muted before hide, snap=True)"
+                    )
+            elif not self._audio_muted_by_user:
+                _mpv_ipc_set_both_mutes(self._ipc_path, self._title, False)
+                self._schedule_subprocess_unmute_reassert()
+            elif _mpv_debug_enabled():
+                _log_mpv(
+                    f"{self._title!r} ipc skip mute=true while visible "
+                    f"(preserve mpv / user key); user_pref_muted={self._audio_muted_by_user}"
+                )
+
+    def set_single_stack_mute_suppressed(self, suppressed: bool) -> None:
+        """In single/stacked mode, hidden tiles must stay muted so only the visible page outputs audio."""
+        prev = self._mute_suppressed_single_stack
+        if self._subprocess and suppressed and not prev:
+            self._mute_needs_stack_hide_ipc_roundtrip = True
+        self._mute_suppressed_single_stack = suppressed
+        # Always refresh IPC/libmpv when a tile is visible: if we skipped earlier while suppressed was
+        # already False, we never sent unmute after mpv was forced muted while hidden.
+        if not suppressed or prev != suppressed:
+            self._apply_output_mute()
 
     def _start_libmpv(self, wid: int) -> None:
         vo = _mpv_vo()
@@ -293,11 +735,23 @@ class StreamTile(QWidget):
             video_latency_hacks=True,
             stream_lavf_o=_LAVF_RECONNECT,
             loglevel="warn",
+            input_default_bindings=True,
+            input_vo_keyboard=True,
         )
         if sys.platform.startswith("linux") and vo in ("gpu", "gpu-next"):
             opts["gpu_context"] = "x11egl"
         self._player = mpv.MPV(**opts)
+        bridge = self._libmpv_mute_bridge
+        if bridge is not None:
+
+            @self._player.on_key_press("m")
+            def _libmpv_m_key() -> None:
+                bridge.toggle_mute.emit()
+
+            self._libmpv_m_key_binding = _libmpv_m_key
         self._player.play(self._url)
+        self._apply_output_mute()
+        QTimer.singleShot(200, self._apply_output_mute)
         if self._mute_btn is not None:
             self._mute_btn.setEnabled(True)
             self._sync_mute_button()
@@ -306,12 +760,7 @@ class StreamTile(QWidget):
         if self._mute_btn is None:
             return
         style = self.style()
-        muted = True
-        if self._player is not None:
-            try:
-                muted = bool(self._player.mute)
-            except Exception:
-                muted = True
+        muted = self._audio_muted_by_user
         if muted:
             self._mute_btn.setIcon(
                 style.standardIcon(QStyle.StandardPixmap.SP_MediaVolumeMuted)
@@ -324,13 +773,27 @@ class StreamTile(QWidget):
     def _toggle_libmpv_mute(self) -> None:
         if self._player is None:
             return
-        try:
-            self._player.mute = not bool(self._player.mute)
-        except Exception:
-            return
+        self._audio_muted_by_user = not self._audio_muted_by_user
+        self._apply_output_mute()
         self._sync_mute_button()
+        if not self._audio_muted_by_user:
+
+            def _kick_audio_output() -> None:
+                if self._player is None or self._audio_muted_by_user:
+                    return
+                try:
+                    self._player.command("ao-reload")
+                except Exception:
+                    pass
+                self._apply_output_mute()
+
+            QTimer.singleShot(150, self._apply_output_mute)
+            QTimer.singleShot(320, _kick_audio_output)
+            QTimer.singleShot(550, self._apply_output_mute)
 
     def shutdown(self) -> None:
+        if self._subprocess_mute_sync_timer is not None:
+            self._subprocess_mute_sync_timer.stop()
         if self._proc is not None:
             if self._proc.state() != QProcess.ProcessState.NotRunning:
                 self._proc.terminate()
@@ -339,14 +802,31 @@ class StreamTile(QWidget):
                     self._proc.waitForFinished(1500)
             self._proc.deleteLater()
             self._proc = None
+        if self._ipc_path:
+            if sys.platform != "win32":
+                try:
+                    os.unlink(self._ipc_path)
+                except OSError:
+                    pass
+            self._ipc_path = None
         if self._mute_btn is not None:
             self._mute_btn.setEnabled(False)
         if self._player is not None:
+            kb = self._libmpv_m_key_binding
+            self._libmpv_m_key_binding = None
+            if kb is not None:
+                try:
+                    kb.unregister_mpv_key_bindings()
+                except Exception:
+                    pass
             try:
                 self._player.terminate()
             except Exception:
                 pass
             self._player = None
+        self._mute_suppressed_single_stack = False
+        self._mute_snapshot_before_stack_hide = None
+        self._mute_needs_stack_hide_ipc_roundtrip = False
         self._started = False
 
 
@@ -592,6 +1072,20 @@ class MainWindow(QMainWindow):
         self._update_view_toolbar_visibility()
         self._refresh_status_text()
         self._persist_viewer_state()
+        self._sync_single_view_audio_mute()
+
+    def _sync_single_view_audio_mute(self) -> None:
+        if not self._tiles:
+            return
+        if not self._single_view:
+            for t in self._tiles:
+                t.set_single_stack_mute_suppressed(False)
+            return
+        idx = self._stack.currentIndex()
+        if idx < 0:
+            idx = 0
+        for i, t in enumerate(self._tiles):
+            t.set_single_stack_mute_suppressed(i != idx)
 
     def _update_nav_buttons(self) -> None:
         en = self._single_view and len(self._tiles) > 1
@@ -613,6 +1107,7 @@ class MainWindow(QMainWindow):
     def _on_stack_index_changed(self, index: int) -> None:
         if self._single_view and index >= 0:
             self._single_index = index
+        self._sync_single_view_audio_mute()
         self._refresh_status_text()
         self._persist_viewer_state()
 
@@ -758,7 +1253,13 @@ def main() -> None:
     apply_viewer_from_yaml(resolve_config_path())
     _apply_qt_platform_for_wid_embed()
     _strip_wayland_so_mpv_uses_x11()
+    if _mpv_debug_enabled():
+        _log_mpv("HIKVISION_DEBUG_MPV=1 — mpv IPC and mute decisions logged to stderr")
     app = QApplication(sys.argv)
+    try:
+        locale.setlocale(locale.LC_NUMERIC, "C")
+    except OSError:
+        pass
     app.setStyle("Fusion")
     if _force_dark_mode():
         _apply_fusion_dark_palette(app)
