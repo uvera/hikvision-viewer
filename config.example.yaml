@@ -1,7 +1,7 @@
 # Copy to $XDG_CONFIG_HOME/hikvision-viewer/config.yaml (default ~/.config/hikvision-viewer/config.yaml)
-# and adjust. Optional secrets: .env or .env.enc in the same two places (XDG dir first, then
-# the directory containing this config; the latter overrides). Use the viewer's "Encrypt env…"
-# button to move .env → .env.enc; the OS keyring holds the Fernet key (Secret Service / Keychain).
+# and adjust. Optional secrets: encrypted `.env.enc` in the same two places (XDG dir first, then
+# the directory containing this config; the latter overrides). The OS keyring holds the Fernet key
+# (Secret Service / Keychain). Legacy plaintext `.env` is not loaded.
 # {ENV_VAR} is substituted from the environment after loading those files.
 #
 # Viewer env (optional): HIKVISION_MPV_SUBPROCESS=1 (default on normal installs) uses one mpv

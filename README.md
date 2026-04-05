@@ -14,7 +14,7 @@ The in-app configuration tab labeled **Playback** adjusts **mpv and display beha
 - **Grid** and **Single** view; keyboard shortcuts (arrow keys, `G` to toggle view, `F11` fullscreen, `Esc` to leave fullscreen).
 - **YAML config** under the XDG config directory (default `~/.config/hikvision-viewer/config.yaml`), with `config.example.yaml` as a template.
 - **Hikvision URL helper** in the configuration editor, plus arbitrary RTSP/custom URLs.
-- **`{ENV_VAR}` placeholders** in URLs, loaded from `.env` or **encrypted `.env.enc`** (OS keyring holds the encryption key).
+- **`{ENV_VAR}` placeholders** in URLs, loaded from **encrypted `.env.enc`** (OS keyring holds the encryption key).
 - **Reload config** from the UI without editing files by hand.
 
 ## Requirements

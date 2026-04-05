@@ -38,21 +38,9 @@ def resolve_config_path() -> Path:
     return d / "config.yaml"
 
 
-def resolve_plain_dotenv_path(config_path: Path) -> Path | None:
-    """First existing plaintext `.env`: next to config, then XDG app dir."""
-    for base in (config_path.parent, app_config_dir()):
-        p = base / ".env"
-        if p.is_file():
-            return p
-    return None
-
-
 def _load_dotenv_dir(base: Path, *, override: bool) -> None:
-    plain = base / ".env"
     enc = base / ".env.enc"
-    if plain.is_file():
-        load_dotenv(plain, override=override)
-    elif enc.is_file():
+    if enc.is_file():
         try:
             text = decrypt_env_file_to_str(enc)
         except Exception as e:
@@ -61,7 +49,7 @@ def _load_dotenv_dir(base: Path, *, override: bool) -> None:
 
 
 def _apply_dotenv(config_path: Path) -> None:
-    """Load .env / .env.enc from the app XDG dir, then from the config directory (override)."""
+    """Load `.env.enc` from the app XDG dir, then from the config directory (override)."""
     _load_dotenv_dir(app_config_dir(), override=False)
     _load_dotenv_dir(config_path.parent, override=True)
 

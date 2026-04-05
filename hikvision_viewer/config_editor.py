@@ -1,4 +1,4 @@
-"""PyQt6 configuration editor: streams (Hikvision URL builder), playback (viewer:), .env."""
+"""PyQt6 configuration editor: streams (Hikvision URL builder), playback (viewer:), .env.enc."""
 
 from __future__ import annotations
 
@@ -38,7 +38,6 @@ from hikvision_viewer.config_loader import (
     load_config_document,
     ordered_stream_names,
     parse_streams_raw,
-    resolve_plain_dotenv_path,
     save_config_document,
     streams_to_yaml_entries,
 )
@@ -75,7 +74,6 @@ class ConfigEditorDialog(QDialog):
         self._rows: list[StreamRow] = []
         self._loading_ui = False
         self._prev_list_row = -1
-        self._env_target_plain: Path | None = None
         self._env_target_enc: Path | None = None
 
         self.setWindowTitle("Edit configuration")
@@ -317,16 +315,9 @@ class ConfigEditorDialog(QDialog):
         self._prev_list_row = 0
         self._load_row_into_ui(0)
 
-        self._env_target_plain = None
         self._env_target_enc = None
-        plain = resolve_plain_dotenv_path(self._config_path)
         enc = self._first_existing_env_enc()
-        if plain is not None:
-            self._env_edit.setPlainText(plain.read_text(encoding="utf-8"))
-            self._env_edit.setEnabled(True)
-            self._env_target_plain = plain
-            self._env_info.setText(f"Editing plaintext secrets: {plain}")
-        elif enc is not None:
+        if enc is not None:
             try:
                 self._env_edit.setPlainText(
                     decrypt_env_file_to_str(enc)
@@ -336,21 +327,21 @@ class ConfigEditorDialog(QDialog):
                 self._env_edit.setEnabled(False)
                 self._env_info.setText(
                     f"Could not decrypt {enc}: {e}\n\n"
-                    "Fix keyring access or restore a plaintext .env backup."
+                    "Fix keyring access or restore a .env.enc backup from this machine."
                 )
             else:
                 self._env_edit.setEnabled(True)
                 self._env_target_enc = enc
                 self._env_info.setText(
-                    f"Editing decrypted secrets (saved back to encrypted file): {enc}\n"
-                    "Plaintext stays in memory only until you save; it is not written to disk."
+                    f"Editing decrypted secrets (saved encrypted to): {enc}\n"
+                    "Plain text exists in memory only until you save."
                 )
         else:
             self._env_edit.clear()
             self._env_edit.setEnabled(True)
             self._env_info.setText(
-                f"No .env yet — saving will create {self._default_new_dotenv_path()} "
-                "if you enter content."
+                f"No .env.enc yet — saving with content will create "
+                f"{self._default_new_env_enc_path()} (encrypted)."
             )
 
         self._loading_ui = False
@@ -400,13 +391,10 @@ class ConfigEditorDialog(QDialog):
                 return p
         return None
 
-    def _default_new_dotenv_path(self) -> Path:
-        plain = resolve_plain_dotenv_path(self._config_path)
-        if plain is not None:
-            return plain
+    def _default_new_env_enc_path(self) -> Path:
         if self._config_path.parent.is_dir():
-            return self._config_path.parent / ".env"
-        return app_config_dir() / ".env"
+            return self._config_path.parent / ".env.enc"
+        return app_config_dir() / ".env.enc"
 
     def _row_from_url(self, name: str, url: str) -> StreamRow:
         parts = try_parse_hikvision_rtsp_url(url)
@@ -648,15 +636,6 @@ class ConfigEditorDialog(QDialog):
 
         if not self._env_edit.isEnabled():
             pass
-        elif self._env_target_plain is not None:
-            try:
-                self._env_target_plain.parent.mkdir(parents=True, exist_ok=True)
-                self._env_target_plain.write_text(
-                    self._env_edit.toPlainText(), encoding="utf-8"
-                )
-            except OSError as e:
-                QMessageBox.warning(self, "Environment", f"Could not save .env: {e}")
-                return
         elif self._env_target_enc is not None:
             try:
                 self._env_target_enc.parent.mkdir(parents=True, exist_ok=True)
@@ -669,12 +648,14 @@ class ConfigEditorDialog(QDialog):
                 )
                 return
         elif self._env_edit.toPlainText().strip():
-            env_path = self._default_new_dotenv_path()
+            enc_path = self._default_new_env_enc_path()
             try:
-                env_path.parent.mkdir(parents=True, exist_ok=True)
-                env_path.write_text(self._env_edit.toPlainText(), encoding="utf-8")
-            except OSError as e:
-                QMessageBox.warning(self, "Environment", f"Could not save .env: {e}")
+                enc_path.parent.mkdir(parents=True, exist_ok=True)
+                encrypt_plaintext_to_path(self._env_edit.toPlainText(), enc_path)
+            except (OSError, RuntimeError, KeyringError) as e:
+                QMessageBox.warning(
+                    self, "Environment", f"Could not save .env.enc: {e}"
+                )
                 return
 
         self._saved = True

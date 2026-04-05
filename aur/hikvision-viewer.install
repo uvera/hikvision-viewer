@@ -1,5 +1,5 @@
 post_install() {
   echo "Menu: Hikvision Viewer (desktop file in /usr/share/applications)"
   echo "Config: \$XDG_CONFIG_HOME/hikvision-viewer/config.yaml (default ~/.config/hikvision-viewer/config.yaml)"
-  echo "Secrets: optional ~/.config/hikvision-viewer/.env — see /usr/share/doc/hikvision-viewer/config.example.yaml"
+  echo "Secrets: optional ~/.config/hikvision-viewer/.env.enc — see /usr/share/doc/hikvision-viewer/config.example.yaml"
 }

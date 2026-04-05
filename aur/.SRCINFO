@@ -1,7 +1,7 @@
 pkgbase = hikvision-viewer
 	pkgdesc = PyQt6 multi-stream RTSP viewer for IP cameras
-	pkgver = 0.2.0
-	pkgrel = 2
+	pkgver = 0.3.0
+	pkgrel = 1
 	url = https://github.com/uvera/hikvision-viewer
 	install = hikvision-viewer.install
 	arch = any
@@ -18,7 +18,7 @@ pkgbase = hikvision-viewer
 	depends = python-keyring
 	depends = python-dotenv
 	depends = python-mpv
-	source = hikvision-viewer-0.2.0.tar.gz::https://github.com/uvera/hikvision-viewer/archive/refs/tags/v0.2.0.tar.gz
-	sha256sums = 9bac9ea13927303fd1288c26fd3ba90c377568fbf1c40c9f988ddf7414645191
+	source = hikvision-viewer-0.3.0.tar.gz::https://github.com/uvera/hikvision-viewer/archive/refs/tags/v0.3.0.tar.gz
+	sha256sums = SKIP
 
 pkgname = hikvision-viewer

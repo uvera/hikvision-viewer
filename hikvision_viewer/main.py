@@ -36,9 +36,7 @@ from hikvision_viewer.config_loader import (
     load_streams,
     ordered_stream_names,
     resolve_config_path,
-    resolve_plain_dotenv_path,
 )
-from hikvision_viewer.env_secure import KeyringError, encrypt_dotenv_move_plain
 
 
 def _viewer_state_path():
@@ -887,16 +885,9 @@ class MainWindow(QMainWindow):
         act_reload = QAction("Reload config", self)
         act_reload.triggered.connect(self._reload)
         settings_menu.addAction(act_reload)
-        act_encrypt = QAction("Encrypt env…", self)
-        act_encrypt.setToolTip(
-            "Move plaintext .env to .env.enc using the OS keyring (Secret Service / "
-            "Keychain / Credential Manager) to hold the encryption key."
-        )
-        act_encrypt.triggered.connect(self._encrypt_env)
-        settings_menu.addAction(act_encrypt)
         act_edit = QAction("Edit configuration…", self)
         act_edit.setToolTip(
-            "Edit streams, Hikvision URL builder, playback options, and .env. "
+            "Edit streams, Hikvision URL builder, playback options, and encrypted .env.enc. "
             "Playback (viewer:) changes need an app restart to apply fully."
         )
         act_edit.triggered.connect(self._edit_configuration)
@@ -1151,39 +1142,6 @@ class MainWindow(QMainWindow):
             self._stack.removeWidget(w)
             w.deleteLater()
 
-    def _encrypt_env(self) -> None:
-        cfg = resolve_config_path()
-        dotenv_path = resolve_plain_dotenv_path(cfg)
-        if dotenv_path is None:
-            QMessageBox.information(
-                self,
-                "Encrypt env",
-                "No plaintext .env found next to the config file or under the app config directory.",
-            )
-            return
-        try:
-            enc_path = encrypt_dotenv_move_plain(dotenv_path)
-        except KeyringError as e:
-            QMessageBox.warning(
-                self,
-                "Encrypt env",
-                f"Could not use the OS keyring: {e}\n\n"
-                "On Linux, install a Secret Service provider (e.g. gnome-keyring or KWallet) "
-                "and python-secretstorage if needed.",
-            )
-            return
-        except OSError as e:
-            QMessageBox.warning(self, "Encrypt env", str(e))
-            return
-        QMessageBox.information(
-            self,
-            "Encrypt env",
-            f"Plaintext removed.\nSecrets are now in:\n{enc_path}\n\n"
-            "The encryption key is stored only in your OS keyring (service "
-            '"hikvision-viewer"). Back up .env.enc and keep keyring access on this machine.',
-        )
-        self._reload()
-
     def _reload(self) -> None:
         path = resolve_config_path()
         self._subprocess = _use_mpv_subprocess()
@@ -1201,7 +1159,7 @@ class MainWindow(QMainWindow):
             cfg_dir = app_config_dir()
             self._status_base = ""
             self._status.setText(
-                f"No config — create {path} (optional secrets in {cfg_dir / '.env'} or .env.enc)"
+                f"No config — create {path} (optional secrets in {cfg_dir / '.env.enc'})"
             )
             self._place_tiles_for_current_mode()
             return
