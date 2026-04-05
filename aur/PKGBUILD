@@ -1,8 +1,9 @@
 # Maintainer: Your Name <you@example.com>
 #
 # GitHub releases: run scripts/release-github-aur.sh from the upstream repo to set url=,
-# source= (tag archive), and sha256sums, and regenerate .SRCINFO. Copy PKGBUILD + .SRCINFO
-# into your AUR clone and push to aur.archlinux.org.
+# source= (tag archive), and sha256sums, and regenerate .SRCINFO. The tag tarball excludes
+# aur/ (.gitattributes export-ignore) so checksum commits can match the archive. Copy PKGBUILD
+# + .SRCINFO into your AUR clone and push to aur.archlinux.org.
 #
 # Local tarball (not GitHub): see scripts/package-release.sh — parent dir must be $pkgname-$pkgver.
 
@@ -17,7 +18,7 @@ depends=('python' 'mpv' 'python-pyqt6' 'python-pyyaml' 'python-cryptography' 'py
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 install=hikvision-viewer.install
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/uvera/hikvision-viewer/archive/refs/tags/v0.3.0.tar.gz")
-sha256sums=('SKIP') # set real sum after pushing tag v0.3.0 (scripts/release-github-aur.sh)
+sha256sums=('SKIP')
 
 build() {
   cd "${pkgname}-${pkgver}"

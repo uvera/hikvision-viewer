@@ -2,6 +2,11 @@
 # Create Git tag + GitHub release with the AppImage, then refresh aur/PKGBUILD and aur/.SRCINFO
 # for publishing to the AUR (separate clone: ssh://aur@aur.archlinux.org/hikvision-viewer.git).
 #
+# The tag is moved (force-pushed) to include the AUR checksum commit: after fetching the archive
+# hash from GitHub, the script commits aur/ updates and updates the tag to that commit. This
+# requires aur/ to be listed as export-ignore in .gitattributes so the source tarball does not
+# contain aur/ and its SHA-256 does not change when only those files are updated.
+#
 # Requirements: git, gh (authenticated), curl, sha256sum. AppImage build needs Docker (see
 # scripts/build-appimage.sh). Regenerating .SRCINFO uses makepkg on Arch, or Docker if unset.
 #
@@ -109,7 +114,13 @@ text = re.sub(r"^pkgver=.*$", f"pkgver={ver}", text, count=1, flags=re.M)
 text = re.sub(r"^pkgrel=.*$", f"pkgrel={pkgrel}", text, count=1, flags=re.M)
 src = 'source=("${pkgname}-${pkgver}.tar.gz::%s")' % archive
 text = re.sub(r"^source=\(.*\)$", src, text, count=1, flags=re.M)
-text = re.sub(r"^sha256sums=\(.*\)$", f"sha256sums=('{sumh}')", text, count=1, flags=re.M)
+text = re.sub(
+    r"^sha256sums=\([^)]*\).*$",
+    f"sha256sums=('{sumh}')",
+    text,
+    count=1,
+    flags=re.M,
+)
 pb.write_text(text)
 PY
 
@@ -134,6 +145,12 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
 fi
 [[ -f "$APPIMG" ]] || die "missing AppImage: $APPIMG (build failed or SKIP_BUILD without artifact?)"
 
+if [[ "${SKIP_AUR_REFRESH:-0}" != "1" ]]; then
+	if git archive --format=tar HEAD | tar tf - | grep -qE '^aur/'; then
+		die "aur/ is included in git archive — add 'aur/ export-ignore' to .gitattributes (see script header)"
+	fi
+fi
+
 if [[ "${SKIP_TAG_PUSH:-0}" != "1" ]]; then
 	if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
 		echo "Tag ${TAG} already exists locally."
@@ -152,6 +169,23 @@ if [[ "${SKIP_AUR_REFRESH:-0}" != "1" ]]; then
 	SUM="$(curl -fsSL "$ARCHIVE_URL" | sha256sum | awk '{print $1}')"
 	[[ -n "$SUM" ]] || die "empty sha256 (fetch failed: is ${TAG} pushed to GitHub?)"
 	refresh_aur_pkgbuild "$SLUG" "$SUM"
+
+	if [[ -n "$(git status --porcelain aur/PKGBUILD aur/.SRCINFO 2>/dev/null || true)" ]]; then
+		git add aur/PKGBUILD aur/.SRCINFO
+		git commit -m "aur: source checksum for ${TAG}"
+		BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+		if [[ "${SKIP_TAG_PUSH:-0}" != "1" ]]; then
+			if [[ "$BR" != "HEAD" ]]; then
+				git push origin "$BR"
+			fi
+			git tag -f "${TAG}"
+			git push -f origin "refs/tags/${TAG}"
+			echo "Committed AUR metadata and moved tag ${TAG} to this commit."
+			sleep 2
+		else
+			echo "Committed AUR metadata locally (SKIP_TAG_PUSH=1: push branch/tag yourself)."
+		fi
+	fi
 fi
 
 if [[ "${SKIP_GH_RELEASE:-0}" != "1" ]]; then
