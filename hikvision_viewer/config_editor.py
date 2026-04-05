@@ -252,6 +252,8 @@ class ConfigEditorDialog(QDialog):
             "Allow native Qt Wayland (disables RTSP embedding on many setups)"
         )
         fl.addWidget(self._pb_wayland)
+        self._pb_dark = QCheckBox("Force dark mode (Fusion palette; ignores system theme)")
+        fl.addWidget(self._pb_dark)
         hint = QLabel(
             "Non-empty HIKVISION_* environment variables already set when the app "
             "starts override these values."
@@ -307,6 +309,7 @@ class ConfigEditorDialog(QDialog):
         self._pb_hwdec.setCurrentIndex(i if i >= 0 else 0)
         self._pb_vo.setText(str(viewer.get("mpv_vo", "gpu") or "gpu"))
         self._pb_wayland.setChecked(bool(viewer.get("qt_wayland", False)))
+        self._pb_dark.setChecked(bool(viewer.get("force_dark_mode", False)))
 
         self._refresh_list_widget()
         self._prev_list_row = -1
@@ -617,6 +620,7 @@ class ConfigEditorDialog(QDialog):
             "mpv_hwdec": self._pb_hwdec.currentText().strip() or "no",
             "mpv_vo": self._pb_vo.text().strip() or "gpu",
             "qt_wayland": self._pb_wayland.isChecked(),
+            "force_dark_mode": self._pb_dark.isChecked(),
             "single_view_order": self._single_view_order_for_save(stream_keys),
         }
 

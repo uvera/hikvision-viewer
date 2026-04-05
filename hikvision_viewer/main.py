@@ -6,7 +6,7 @@ import sys
 
 import mpv
 from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer
-from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -77,6 +77,50 @@ def _mpv_vo() -> str:
 
 def _use_mpv_subprocess() -> bool:
     return _env_flag("HIKVISION_MPV_SUBPROCESS", "1")
+
+
+def _force_dark_mode() -> bool:
+    return _env_flag("HIKVISION_FORCE_DARK", "0")
+
+
+def _apply_fusion_dark_palette(app: QApplication) -> None:
+    """Dark Fusion palette (ignores system light theme for Qt widgets)."""
+    palette = QPalette()
+    c_window = QColor(53, 53, 53)
+    c_window_text = QColor(220, 220, 220)
+    c_base = QColor(35, 35, 35)
+    c_alt = QColor(45, 45, 45)
+    c_highlight = QColor(64, 128, 200)
+    c_disabled = QColor(127, 127, 127)
+
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
+    ):
+        palette.setColor(group, QPalette.ColorRole.Window, c_window)
+        palette.setColor(group, QPalette.ColorRole.WindowText, c_window_text)
+        palette.setColor(group, QPalette.ColorRole.Base, c_base)
+        palette.setColor(group, QPalette.ColorRole.AlternateBase, c_alt)
+        palette.setColor(group, QPalette.ColorRole.ToolTipBase, c_base)
+        palette.setColor(group, QPalette.ColorRole.ToolTipText, c_window_text)
+        palette.setColor(group, QPalette.ColorRole.Text, c_window_text)
+        palette.setColor(group, QPalette.ColorRole.Button, c_window)
+        palette.setColor(group, QPalette.ColorRole.ButtonText, c_window_text)
+        palette.setColor(group, QPalette.ColorRole.Link, QColor(100, 180, 255))
+        palette.setColor(group, QPalette.ColorRole.Highlight, c_highlight)
+        palette.setColor(group, QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+        palette.setColor(group, QPalette.ColorRole.PlaceholderText, c_disabled)
+
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, c_disabled)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, c_disabled)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, c_disabled)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor(80, 80, 80))
+    palette.setColor(
+        QPalette.ColorGroup.Disabled, QPalette.ColorRole.HighlightedText, c_disabled
+    )
+
+    app.setPalette(palette)
 
 
 def _apply_qt_platform_for_wid_embed() -> None:
@@ -666,6 +710,8 @@ def main() -> None:
     _strip_wayland_so_mpv_uses_x11()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    if _force_dark_mode():
+        _apply_fusion_dark_palette(app)
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

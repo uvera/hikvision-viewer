@@ -192,6 +192,10 @@ def apply_viewer_from_yaml(config_path: Path) -> None:
         _env_set_if_unset(
             "HIKVISION_QT_WAYLAND", "1" if viewer["qt_wayland"] else "0"
         )
+    if "force_dark_mode" in viewer and isinstance(viewer["force_dark_mode"], bool):
+        _env_set_if_unset(
+            "HIKVISION_FORCE_DARK", "1" if viewer["force_dark_mode"] else "0"
+        )
 
 
 def parse_streams_raw(data: dict) -> dict[str, str]:
