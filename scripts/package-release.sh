@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build dist/hikvision-viewer-<version>.tar.gz (clean tree for makepkg/AUR),
-# copy it to aur/, refresh sha256sums in PKGBUILD, and run python -m build (wheel + sdist).
+# Build dist/hikvision-viewer-<version>.tar.gz (clean tree for local makepkg),
+# copy it to aur/, refresh sha256sums for a *local* source=() line, and run python -m build.
+# For published GitHub tags + AUR metadata, use scripts/release-github-aur.sh instead.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
