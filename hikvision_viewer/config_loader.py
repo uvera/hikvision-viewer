@@ -2,6 +2,7 @@ import io
 import os
 import re
 from pathlib import Path
+import logging
 
 import yaml
 from dotenv import load_dotenv
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 from hikvision_viewer.env_secure import decrypt_env_file_to_str
 
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+LOG = logging.getLogger(__name__)
 
 
 def app_config_dir() -> Path:
@@ -41,9 +43,11 @@ def resolve_config_path() -> Path:
 def _load_dotenv_dir(base: Path, *, override: bool) -> None:
     enc = base / ".env.enc"
     if enc.is_file():
+        LOG.info("Loading encrypted environment file: %s", enc)
         try:
             text = decrypt_env_file_to_str(enc)
         except Exception as e:
+            LOG.exception("Failed decrypting env file: %s", enc)
             raise ValueError(f"Cannot decrypt {enc}: {e}") from e
         load_dotenv(stream=io.StringIO(text), override=override)
 
@@ -109,6 +113,7 @@ def ordered_stream_names(config_path: Path, streams: dict[str, str]) -> list[str
 
 
 def load_streams(config_path: Path) -> dict[str, str]:
+    LOG.info("Loading streams from config: %s", config_path)
     _apply_dotenv(config_path)
     data = yaml.safe_load(config_path.read_text())
     if not data or "streams" not in data:
@@ -124,6 +129,7 @@ def load_streams(config_path: Path) -> dict[str, str]:
         if not isinstance(url, str):
             raise ValueError(f"stream {name!r}: url must be a string")
         out[str(name)] = expand_env(url)
+    LOG.info("Loaded %d stream definitions", len(out))
     return out
 
 
@@ -147,6 +153,7 @@ def save_config_document(config_path: Path, data: dict) -> None:
     tmp = config_path.with_suffix(config_path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(config_path)
+    LOG.info("Saved configuration document: %s", config_path)
 
 
 def _env_set_if_unset(name: str, value: str) -> None:
@@ -159,11 +166,14 @@ def _env_set_if_unset(name: str, value: str) -> None:
 def apply_viewer_from_yaml(config_path: Path) -> None:
     """Apply optional viewer: block to process env; existing non-empty env wins."""
     if not config_path.is_file():
+        LOG.info("No config found for viewer defaults: %s", config_path)
         return
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     viewer = data.get("viewer")
     if not isinstance(viewer, dict):
+        LOG.info("No viewer block present in config: %s", config_path)
         return
+    LOG.info("Applying viewer defaults from config: %s", config_path)
     if "mpv_subprocess" in viewer and isinstance(viewer["mpv_subprocess"], bool):
         _env_set_if_unset(
             "HIKVISION_MPV_SUBPROCESS", "1" if viewer["mpv_subprocess"] else "0"

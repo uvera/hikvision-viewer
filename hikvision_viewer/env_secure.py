@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 
 import keyring
 from cryptography.fernet import Fernet, InvalidToken
@@ -10,6 +11,7 @@ from keyring.errors import KeyringError
 
 _SERVICE = "hikvision-viewer"
 _KEY_ENTRY = "dotenv-fernet-v1"
+LOG = logging.getLogger(__name__)
 
 
 def _fernet_for_encrypt() -> Fernet:
@@ -18,6 +20,7 @@ def _fernet_for_encrypt() -> Fernet:
         return Fernet(stored.encode("ascii"))
     key = Fernet.generate_key()
     keyring.set_password(_SERVICE, _KEY_ENTRY, key.decode("ascii"))
+    LOG.info("Generated and stored new keyring key for %s", _SERVICE)
     return Fernet(key)
 
 
@@ -33,6 +36,7 @@ def _fernet_for_decrypt() -> Fernet:
 
 def decrypt_env_file_to_str(enc_path: Path) -> str:
     blob = enc_path.read_bytes()
+    LOG.info("Decrypting encrypted env file: %s", enc_path)
     f = _fernet_for_decrypt()
     try:
         return f.decrypt(blob).decode("utf-8")
@@ -45,6 +49,7 @@ def decrypt_env_file_to_str(enc_path: Path) -> str:
 def encrypt_plaintext_to_path(plaintext: str, enc_path: Path) -> None:
     f = _fernet_for_encrypt()
     enc_path.write_bytes(f.encrypt(plaintext.encode("utf-8")))
+    LOG.info("Wrote encrypted env file: %s", enc_path)
 
 
 __all__ = [

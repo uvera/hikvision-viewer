@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import logging
 from urllib.parse import unquote, urlparse
+
+LOG = logging.getLogger(__name__)
 
 
 def _host_and_port(hostport: str) -> tuple[str, int]:
@@ -79,16 +82,20 @@ def build_hikvision_rtsp_url(
 def try_parse_hikvision_rtsp_url(url: str) -> HikvisionUrlParts | None:
     u = urlparse(url.strip())
     if u.scheme != "rtsp":
+        LOG.debug("URL is not RTSP, cannot parse as Hikvision: %s", url)
         return None
     path = (u.path or "").replace("\\", "/").rstrip("/")
     m = re.search(r"/Streaming/Channels/(\d+)$", path)
     if not m:
+        LOG.debug("URL path does not match Hikvision channels path: %s", u.path)
         return None
     ch = int(m.group(1))
     if ch not in (101, 102):
+        LOG.debug("Unsupported Hikvision channel in URL: %s", ch)
         return None
     parsed = _parse_rtsp_netloc(u.netloc)
     if parsed is None:
+        LOG.debug("Could not parse RTSP netloc: %s", u.netloc)
         return None
     user, password, host, port = parsed
     return HikvisionUrlParts(

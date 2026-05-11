@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -50,6 +51,8 @@ from hikvision_viewer.hikvision_rtsp import (
     build_hikvision_rtsp_url,
     try_parse_hikvision_rtsp_url,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -291,6 +294,7 @@ class ConfigEditorDialog(QDialog):
         lay.addWidget(self._env_edit)
 
     def _reload_from_disk(self) -> None:
+        LOG.info("Reloading config editor state from disk: %s", self._config_path)
         self._loading_ui = True
         data = load_config_document(self._config_path)
         raw_streams = parse_streams_raw(data)
@@ -568,6 +572,7 @@ class ConfigEditorDialog(QDialog):
         while f"{base}_{n}" in names:
             n += 1
         self._rows.append(StreamRow(name=f"{base}_{n}"))
+        LOG.info("Added stream row: %s_%d", base, n)
         self._refresh_list_widget()
         self._list.setCurrentRow(len(self._rows) - 1)
 
@@ -575,7 +580,9 @@ class ConfigEditorDialog(QDialog):
         idx = self._current_row_index()
         if idx < 0 or not self._rows:
             return
+        removed_name = self._rows[idx].name
         del self._rows[idx]
+        LOG.info("Removed stream row: %s", removed_name)
         if not self._rows:
             self._rows.append(StreamRow(name="camera_1"))
         self._refresh_list_widget()
@@ -633,6 +640,11 @@ class ConfigEditorDialog(QDialog):
         except OSError as e:
             QMessageBox.warning(self, "Configuration", f"Could not save YAML: {e}")
             return
+        LOG.info(
+            "Saved configuration via editor: %s (%d streams)",
+            self._config_path,
+            len(streams),
+        )
 
         if not self._env_edit.isEnabled():
             pass
@@ -670,6 +682,12 @@ class ConfigEditorDialog(QDialog):
 
 def open_config_editor(parent: QWidget, config_path: Path) -> tuple[bool, bool]:
     """Show the editor modally. Returns (saved, viewer_changed)."""
+    LOG.info("Opening config editor for: %s", config_path)
     dlg = ConfigEditorDialog(config_path, parent=parent)
     dlg.exec()
+    LOG.info(
+        "Config editor closed: saved=%s viewer_changed=%s",
+        dlg.saved(),
+        dlg.viewer_changed(),
+    )
     return dlg.saved(), dlg.viewer_changed()

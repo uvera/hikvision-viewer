@@ -40,6 +40,31 @@ hikvision-viewer
 
 If no config exists yet, copy `config.example.yaml` to `~/.config/hikvision-viewer/config.yaml` (or place `config.yaml` next to your checkout for development) and set your stream URLs and environment variables.
 
+## Wayland / Niri notes
+
+This viewer embeds `mpv` into Qt widgets (`--wid`), which needs an X11-compatible Qt backend. On GNOME this is often automatic, but some launchers under Wayland compositors (for example Niri) can start apps with environment differences that break embedding.
+
+For launcher-based starts, set at least:
+
+```bash
+QT_QPA_PLATFORM=xcb HIKVISION_QT_WAYLAND=0
+```
+
+Optional (recommended for multi-stream stability):
+
+```bash
+HIKVISION_MPV_SUBPROCESS=1 HIKVISION_MPV_HWDEC=no HIKVISION_MPV_VO=gpu
+```
+
+`DISPLAY` usually does not need to be forced manually if Niri Xwayland integration is working.
+
+## Logging
+
+- App logs are written to `~/.config/hikvision-viewer/hikvision-viewer.log` by default.
+- Set `HIKVISION_LOG_FILE=/custom/path.log` to use a different log file.
+- Set `HIKVISION_LOG_LEVEL=DEBUG` for verbose diagnostics.
+- Set `HIKVISION_DEBUG_MPV=1` to include detailed mpv IPC/mute logs.
+
 ## Configuration notes
 
 See comments in **`config.example.yaml`** for:

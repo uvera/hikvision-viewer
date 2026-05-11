@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import locale
+import logging
 import os
 import shutil
 import socket
@@ -37,6 +38,10 @@ from hikvision_viewer.config_loader import (
     ordered_stream_names,
     resolve_config_path,
 )
+from hikvision_viewer.logging_utils import configure_logging
+
+LOG = logging.getLogger(__name__)
+MPV_LOG = logging.getLogger("hikvision_viewer.mpv")
 
 
 def _viewer_state_path():
@@ -77,6 +82,23 @@ def _mpv_vo() -> str:
     return os.environ.get("HIKVISION_MPV_VO", "gpu").strip() or "gpu"
 
 
+def _mpv_gpu_context() -> str:
+    """Optional explicit mpv GPU context; empty lets mpv auto-pick."""
+    return os.environ.get("HIKVISION_MPV_GPU_CONTEXT", "").strip()
+
+
+def _subprocess_gpu_context_for_embed(vo: str) -> str:
+    """Use an X11-compatible context for --wid embedding unless explicitly overridden."""
+    explicit = _mpv_gpu_context()
+    if explicit:
+        return explicit
+    if sys.platform.startswith("linux") and vo in ("gpu", "gpu-next"):
+        # Wayland GPU contexts can ignore --wid and spawn separate windows.
+        # x11egl is generally more robust for embedded --wid rendering than plain x11.
+        return "x11egl"
+    return ""
+
+
 def _use_mpv_subprocess() -> bool:
     # PyInstaller/AppImage ships libmpv, not the `mpv` binary; subprocess mode needs mpv on PATH.
     default = "0" if getattr(sys, "frozen", False) else "1"
@@ -93,7 +115,7 @@ def _mpv_debug_enabled() -> bool:
 
 def _log_mpv(msg: str) -> None:
     if _mpv_debug_enabled():
-        print(f"[hikvision-viewer mpv] {msg}", file=sys.stderr, flush=True)
+        MPV_LOG.debug("%s", msg)
 
 
 def _apply_fusion_dark_palette(app: QApplication) -> None:
@@ -142,11 +164,11 @@ def _apply_qt_platform_for_wid_embed() -> None:
         return
     if _env_flag("HIKVISION_QT_WAYLAND", "0"):
         return
-    if not os.environ.get("WAYLAND_DISPLAY"):
-        return
     qpa = (os.environ.get("QT_QPA_PLATFORM") or "").strip().lower()
     if qpa and qpa not in ("wayland", ""):
         return
+    # Some launchers sanitize WAYLAND_DISPLAY and skip the older Wayland check,
+    # but --wid embedding still requires an X11-capable Qt backend.
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 
@@ -160,6 +182,35 @@ def _strip_wayland_so_mpv_uses_x11() -> None:
         return
     os.environ.pop("WAYLAND_DISPLAY", None)
     os.environ.pop("WAYLAND_SOCKET", None)
+
+
+def _log_display_env() -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    LOG.info(
+        "Display env: XDG_SESSION_TYPE=%r QT_QPA_PLATFORM=%r DISPLAY=%r WAYLAND_DISPLAY=%r HIKVISION_QT_WAYLAND=%r",
+        os.environ.get("XDG_SESSION_TYPE"),
+        os.environ.get("QT_QPA_PLATFORM"),
+        os.environ.get("DISPLAY"),
+        os.environ.get("WAYLAND_DISPLAY"),
+        os.environ.get("HIKVISION_QT_WAYLAND"),
+    )
+
+
+def _x11_embed_unavailable_reason() -> str | None:
+    """Return a user-facing reason when --wid embedding cannot work in current launcher env."""
+    if not sys.platform.startswith("linux"):
+        return None
+    qpa = (os.environ.get("QT_QPA_PLATFORM") or "").strip().lower()
+    if qpa != "xcb":
+        shown = qpa or "<auto>"
+        return (
+            f"Qt platform is {shown!r}; mpv --wid embedding needs X11/XWayland "
+            "(set QT_QPA_PLATFORM=xcb)"
+        )
+    if not os.environ.get("DISPLAY"):
+        return "DISPLAY is not set; X11/XWayland is unavailable in this launcher environment"
+    return None
 
 
 def _mpv_subprocess_environment() -> QProcessEnvironment:
@@ -428,7 +479,11 @@ class StreamTile(QWidget):
         self._subprocess = subprocess
         self._player: mpv.MPV | None = None
         self._proc: QProcess | None = None
+        self._proc_output_tail: list[str] = []
         self._ipc_path: str | None = None
+        self._shutting_down = False
+        self._start_wait_attempts = 0
+        self._embed_restart_attempts = 0
         self._started = False
         self._audio_muted_by_user = True
         self._mute_suppressed_single_stack = False
@@ -487,26 +542,69 @@ class StreamTile(QWidget):
         if self._started:
             return
         self._started = True
+        self._start_wait_attempts = 0
+        self._embed_restart_attempts = 0
         # Map the X11 window before mpv attaches; subprocess needs a real mapped wid.
         delay_ms = 150 if self._subprocess else 0
         QTimer.singleShot(delay_ms, self._start_player)
 
+    def _schedule_start_retry(self, reason: str, delay_ms: int = 120) -> bool:
+        self._start_wait_attempts += 1
+        if self._start_wait_attempts > 25:
+            LOG.error(
+                "Timed out waiting for stable native window for %s (%s)",
+                self._title,
+                reason,
+            )
+            self._label.setText(f"{self._title} (surface init timeout)")
+            return False
+        LOG.debug(
+            "Delaying stream start for %s: %s (attempt %d/25)",
+            self._title,
+            reason,
+            self._start_wait_attempts,
+        )
+        QTimer.singleShot(delay_ms, self._start_player)
+        return True
+
     def _start_player(self) -> None:
+        if self._proc is not None or self._player is not None:
+            return
+        embed_reason = _x11_embed_unavailable_reason()
+        if embed_reason:
+            self._label.setText(f"{self._title} (X11/XWayland unavailable)")
+            LOG.error("Cannot start embedded mpv for %s: %s", self._title, embed_reason)
+            return
         if not self._surface.isVisible():
+            self._schedule_start_retry("surface not visible")
+            return
+        if not self.isVisible():
+            self._schedule_start_retry("tile not visible")
+            return
+        handle = self._surface.windowHandle()
+        if handle is not None and not handle.isExposed():
+            self._schedule_start_retry("surface window handle not exposed yet")
             return
         try:
             wid = int(self._surface.winId())
         except Exception:
+            LOG.exception("Could not get window id for tile: %s", self._title)
             self._label.setText(f"{self._title} (no window id)")
             return
+        if wid <= 0:
+            self._schedule_start_retry(f"invalid window id {wid}")
+            return
+        LOG.info("Starting stream tile: %s (subprocess=%s)", self._title, self._subprocess)
         if self._subprocess:
             self._start_subprocess(wid)
         else:
             self._start_libmpv(wid)
 
     def _start_subprocess(self, wid: int) -> None:
+        self._shutting_down = False
         exe = shutil.which("mpv")
         if not exe:
+            LOG.error("mpv binary not found in PATH for stream %s", self._title)
             self._label.setText(f"{self._title} (mpv not in PATH)")
             return
         proc = QProcess(self)
@@ -541,21 +639,41 @@ class StreamTile(QWidget):
             f"--stream-lavf-o={_LAVF_RECONNECT}",
             "--msg-level=all=no",
         ]
-        # vo=gpu still picks Wayland EGL if WAYLAND_DISPLAY is set; we strip it above
-        # and pin the GPU context when using X11 embed.
-        if sys.platform.startswith("linux") and vo in ("gpu", "gpu-next"):
-            args.append("--gpu-context=x11egl")
+        gpu_context = _subprocess_gpu_context_for_embed(vo)
+        if gpu_context:
+            args.append(f"--gpu-context={gpu_context}")
         args.append(self._url)
         proc.finished.connect(self._on_proc_finished)
+        proc.readyReadStandardOutput.connect(self._on_proc_output_ready)
         # Do not use errorOccurred(ProcessError): PyQt6 may fail converting the enum to Python
         # (TypeError: unable to convert C++ 'QProcess::ProcessError'...). Slot takes no args; read
         # error from the process (same as Qt allows for slots with fewer parameters than the signal).
         proc.errorOccurred.connect(self._on_proc_error)
         proc.started.connect(self._on_subprocess_started)
         self._proc = proc
+        LOG.info("Launching mpv subprocess for stream %s", self._title)
         proc.start(exe, args)
 
+    def _on_proc_output_ready(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        out = bytes(proc.readAllStandardOutput())
+        if not out:
+            return
+        text = out.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            self._proc_output_tail.append(line)
+            if len(self._proc_output_tail) > 60:
+                self._proc_output_tail = self._proc_output_tail[-60:]
+            LOG.debug("mpv[%s]: %s", self._title, line)
+
     def _on_proc_error(self) -> None:
+        if self._shutting_down:
+            return
         proc = self._proc
         if proc is None:
             return
@@ -580,16 +698,59 @@ class StreamTile(QWidget):
         else:
             detail = "error"
         self._label.setText(f"{self._title} (mpv start error: {detail})")
+        LOG.error("mpv subprocess error for %s: %s", self._title, detail)
 
     def _on_proc_finished(self, code: int, status: QProcess.ExitStatus) -> None:
         if self._proc is None:
             return
+        if self._shutting_down:
+            if status == QProcess.ExitStatus.CrashExit or code != 0:
+                LOG.debug(
+                    "mpv subprocess exited during shutdown for %s: code=%s status=%s",
+                    self._title,
+                    code,
+                    status,
+                )
+            return
+        tail = "\n".join(self._proc_output_tail[-12:])
+        bad_window = "BadWindow" in tail or "X_DestroyWindow" in tail
+        if (
+            code != 0
+            and bad_window
+            and self._subprocess
+            and self._embed_restart_attempts < 2
+        ):
+            self._embed_restart_attempts += 1
+            LOG.info(
+                "mpv embed startup race for %s (BadWindow), retrying (%d/2)",
+                self._title,
+                self._embed_restart_attempts,
+            )
+            self._proc.deleteLater()
+            self._proc = None
+            self._proc_output_tail.clear()
+            QTimer.singleShot(220, self._start_player)
+            return
         if status == QProcess.ExitStatus.CrashExit:
             self._label.setText(f"{self._title} (mpv crashed)")
+            if tail:
+                LOG.error("mpv subprocess crashed for %s. tail:\n%s", self._title, tail)
+            else:
+                LOG.error("mpv subprocess crashed for stream %s", self._title)
         elif code != 0:
             self._label.setText(f"{self._title} (mpv exited {code})")
+            if tail:
+                LOG.warning(
+                    "mpv subprocess exited non-zero for %s: %s. tail:\n%s",
+                    self._title,
+                    code,
+                    tail,
+                )
+            else:
+                LOG.warning("mpv subprocess exited non-zero for %s: %s", self._title, code)
 
     def _on_subprocess_started(self) -> None:
+        self._embed_restart_attempts = 0
         QTimer.singleShot(100, self._subprocess_startup_audio_sync)
         if self._subprocess_mute_sync_timer is None:
             t = QTimer(self)
@@ -722,6 +883,7 @@ class StreamTile(QWidget):
 
     def _start_libmpv(self, wid: int) -> None:
         vo = _mpv_vo()
+        gpu_context = _mpv_gpu_context()
         opts: dict = dict(
             wid=str(wid),
             vo=vo,
@@ -736,8 +898,9 @@ class StreamTile(QWidget):
             input_default_bindings=True,
             input_vo_keyboard=True,
         )
-        if sys.platform.startswith("linux") and vo in ("gpu", "gpu-next"):
-            opts["gpu_context"] = "x11egl"
+        if gpu_context:
+            opts["gpu_context"] = gpu_context
+        LOG.info("Launching libmpv for stream %s", self._title)
         self._player = mpv.MPV(**opts)
         bridge = self._libmpv_mute_bridge
         if bridge is not None:
@@ -790,6 +953,8 @@ class StreamTile(QWidget):
             QTimer.singleShot(550, self._apply_output_mute)
 
     def shutdown(self) -> None:
+        LOG.debug("Shutting down stream tile: %s", self._title)
+        self._shutting_down = True
         if self._subprocess_mute_sync_timer is not None:
             self._subprocess_mute_sync_timer.stop()
         if self._proc is not None:
@@ -800,6 +965,7 @@ class StreamTile(QWidget):
                     self._proc.waitForFinished(1500)
             self._proc.deleteLater()
             self._proc = None
+            self._proc_output_tail.clear()
         if self._ipc_path:
             if sys.platform != "win32":
                 try:
@@ -825,12 +991,15 @@ class StreamTile(QWidget):
         self._mute_suppressed_single_stack = False
         self._mute_snapshot_before_stack_hide = None
         self._mute_needs_stack_hide_ipc_roundtrip = False
+        self._start_wait_attempts = 0
+        self._embed_restart_attempts = 0
         self._started = False
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        LOG.info("Initializing main window")
         self.setWindowTitle("Hikvision RTSP viewer")
         self.resize(1280, 720)
         self._tiles: list[StreamTile] = []
@@ -1145,6 +1314,7 @@ class MainWindow(QMainWindow):
     def _reload(self) -> None:
         path = resolve_config_path()
         self._subprocess = _use_mpv_subprocess()
+        LOG.info("Reloading UI streams from config: %s", path)
 
         prev_name: str | None = None
         if self._single_view and self._stack.count():
@@ -1162,6 +1332,7 @@ class MainWindow(QMainWindow):
                 f"No config — create {path} (optional secrets in {cfg_dir / '.env.enc'})"
             )
             self._place_tiles_for_current_mode()
+            LOG.warning("Config file not found: %s", path)
             return
         try:
             streams = load_streams(path)
@@ -1170,6 +1341,7 @@ class MainWindow(QMainWindow):
             self._status.setText(f"Config error: {e}")
             QMessageBox.warning(self, "Config", str(e))
             self._place_tiles_for_current_mode()
+            LOG.exception("Failed loading streams from config: %s", path)
             return
 
         names = ordered_stream_names(path, streams)
@@ -1177,6 +1349,7 @@ class MainWindow(QMainWindow):
             url = streams[name]
             tile = StreamTile(name, url, subprocess=self._subprocess)
             self._tiles.append(tile)
+        LOG.info("Loaded %d stream tiles", len(self._tiles))
 
         if prev_name in names:
             self._single_index = names.index(prev_name)
@@ -1202,15 +1375,23 @@ class MainWindow(QMainWindow):
             t.repaint()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        LOG.info("Main window closing")
         self._persist_viewer_state()
         self._clear_grid()
         super().closeEvent(event)
 
 
 def main() -> None:
+    log_path = configure_logging()
+    LOG.info("Application startup (argv=%s)", sys.argv)
+    LOG.info("Log file path: %s", log_path)
     apply_viewer_from_yaml(resolve_config_path())
     _apply_qt_platform_for_wid_embed()
     _strip_wayland_so_mpv_uses_x11()
+    _log_display_env()
+    embed_reason = _x11_embed_unavailable_reason()
+    if embed_reason:
+        LOG.error("Embedded video cannot start in current environment: %s", embed_reason)
     if _mpv_debug_enabled():
         _log_mpv("HIKVISION_DEBUG_MPV=1 — mpv IPC and mute decisions logged to stderr")
     app = QApplication(sys.argv)
@@ -1223,7 +1404,9 @@ def main() -> None:
         _apply_fusion_dark_palette(app)
     w = MainWindow()
     w.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    LOG.info("Application exited with code %s", code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
