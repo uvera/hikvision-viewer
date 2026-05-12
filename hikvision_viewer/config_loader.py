@@ -1,8 +1,10 @@
 import io
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 import logging
+from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
@@ -11,6 +13,76 @@ from hikvision_viewer.env_secure import decrypt_env_file_to_str
 
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 LOG = logging.getLogger(__name__)
+
+StreamUrlType = Literal["hikvision", "custom"]
+DEFAULT_STREAM_URL_TYPE: StreamUrlType = "hikvision"
+_ALLOWED_STREAM_URL_TYPES = frozenset(("hikvision", "custom"))
+
+
+@dataclass(frozen=True)
+class StreamYamlSpec:
+    """One stream entry as stored under `streams:` in YAML (before env expansion)."""
+
+    url: str
+    url_type: StreamUrlType = DEFAULT_STREAM_URL_TYPE
+
+
+def normalize_stream_url_type(raw: object | None) -> StreamUrlType:
+    """Return a valid url_type; default is hikvision when missing."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return DEFAULT_STREAM_URL_TYPE
+    if not isinstance(raw, str):
+        raise ValueError(f"stream url_type must be a string, got {type(raw).__name__}")
+    s = raw.strip().lower()
+    if s not in _ALLOWED_STREAM_URL_TYPES:
+        raise ValueError(
+            "stream url_type must be 'hikvision' or 'custom', "
+            f"got {raw!r}"
+        )
+    return s  # type: ignore[return-value]
+
+
+def infer_legacy_stream_url_type(url: str) -> StreamUrlType:
+    """If `url_type` is omitted in YAML, match pre–url_type behavior and NVR placeholders.
+
+    Fully-resolved Hikvision paths are detected via :func:`try_parse_hikvision_rtsp_url`.
+    URLs with ``{ENV}`` placeholders in the channel segment are still treated as
+    **hikvision** when the path looks like ``/Streaming/Channels/<anything>``.
+    """
+    from urllib.parse import urlparse
+
+    from hikvision_viewer.hikvision_rtsp import try_parse_hikvision_rtsp_url
+
+    if try_parse_hikvision_rtsp_url(url) is not None:
+        return "hikvision"
+    u = urlparse(url.strip())
+    if u.scheme != "rtsp":
+        return "custom"
+    path = (u.path or "").replace("\\", "/").rstrip("/")
+    if re.search(r"/Streaming/Channels/.+", path):
+        return "hikvision"
+    return "custom"
+
+
+def parse_stream_entry(name: str, spec: object) -> StreamYamlSpec:
+    """Normalize a YAML `streams:` value to url + url_type."""
+    if isinstance(spec, str):
+        url = spec
+        ut = infer_legacy_stream_url_type(url)
+        return StreamYamlSpec(url=url, url_type=ut)
+    if isinstance(spec, dict):
+        raw_url = spec.get("url")
+        if not isinstance(raw_url, str):
+            raise ValueError(f"stream {name!r}: dict entry must contain a string 'url'")
+        if "url_type" in spec and spec.get("url_type") is not None:
+            try:
+                ut = normalize_stream_url_type(spec.get("url_type"))
+            except ValueError as e:
+                raise ValueError(f"stream {name!r}: {e}") from e
+        else:
+            ut = infer_legacy_stream_url_type(raw_url)
+        return StreamYamlSpec(url=raw_url, url_type=ut)
+    raise ValueError(f"stream {name!r}: expected string or {{url: ...}}")
 
 
 def app_config_dir() -> Path:
@@ -119,16 +191,12 @@ def load_streams(config_path: Path) -> dict[str, str]:
     if not data or "streams" not in data:
         raise ValueError("config must contain a 'streams' mapping")
     out: dict[str, str] = {}
-    for name, spec in data["streams"].items():
-        if isinstance(spec, str):
-            url = spec
-        elif isinstance(spec, dict) and "url" in spec:
-            url = spec["url"]
-        else:
-            raise ValueError(f"stream {name!r}: expected string or {{url: ...}}")
-        if not isinstance(url, str):
-            raise ValueError(f"stream {name!r}: url must be a string")
-        out[str(name)] = expand_env(url)
+    streams = data["streams"]
+    if not isinstance(streams, dict):
+        raise ValueError("'streams' must be a mapping")
+    for name, spec in streams.items():
+        entry = parse_stream_entry(str(name), spec)
+        out[str(name)] = expand_env(entry.url)
     LOG.info("Loaded %d stream definitions", len(out))
     return out
 
@@ -196,22 +264,21 @@ def apply_viewer_from_yaml(config_path: Path) -> None:
         )
 
 
-def parse_streams_raw(data: dict) -> dict[str, str]:
-    """Extract stream name -> url strings without expanding env."""
+def parse_streams_raw(data: dict) -> dict[str, StreamYamlSpec]:
+    """Extract stream name -> URL + url_type without expanding env."""
     if not data or "streams" not in data:
         return {}
     streams = data["streams"]
     if not isinstance(streams, dict):
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, StreamYamlSpec] = {}
     for name, spec in streams.items():
-        if isinstance(spec, str):
-            out[str(name)] = spec
-        elif isinstance(spec, dict) and isinstance(spec.get("url"), str):
-            out[str(name)] = spec["url"]
+        out[str(name)] = parse_stream_entry(str(name), spec)
     return out
 
 
-def streams_to_yaml_entries(streams: dict[str, str]) -> dict:
-    """Normalize to name -> {url: ...} for YAML under streams:."""
-    return {k: {"url": v} for k, v in streams.items()}
+def streams_to_yaml_entries(specs: dict[str, StreamYamlSpec]) -> dict[str, dict[str, str]]:
+    """Normalize to name -> {url, url_type} for YAML under streams:."""
+    return {
+        k: {"url": v.url, "url_type": v.url_type} for k, v in specs.items()
+    }

@@ -4,6 +4,17 @@
 # (Secret Service / Keychain). Legacy plaintext `.env` is not loaded.
 # {ENV_VAR} is substituted from the environment after loading those files.
 #
+# Each stream entry is either a raw URL string or a mapping with:
+#   url: rtsp://...
+#   url_type: hikvision | custom   # optional; default is hikvision
+#
+# Use url_type: custom for RTSP URLs that are not Hikvision / NVR channel paths, so the
+# configuration editor treats them as opaque (no structured Hikvision fields).
+# NVR-style URLs (via the recorder) still use the Hikvision path pattern, e.g.:
+#   rtsp://USER:PASS@NVR_IP:554/Streaming/Channels/301
+# Omitted url_type on existing configs is inferred: URLs matching the Hikvision path
+# pattern become hikvision; others become custom.
+#
 # Viewer env (optional): HIKVISION_MPV_SUBPROCESS=1 (default on normal installs) uses one mpv
 # process per tile (needs `mpv` on PATH). AppImage/PyInstaller defaults to 0 (bundled libmpv).
 # HIKVISION_MPV_HWDEC=no (default) avoids many
@@ -29,13 +40,23 @@
 streams:
   side_enterance:
     url: rtsp://admin:{CAM_SIDE_ENTERANCE_PASSWORD}@{CAM_SIDE_ENTERANCE_IP}:554/Streaming/Channels/101
+    url_type: hikvision
   side_enterance_sub:
     url: rtsp://admin:{CAM_SIDE_ENTERANCE_PASSWORD}@{CAM_SIDE_ENTERANCE_IP}:554/Streaming/Channels/102
+    url_type: hikvision
   front_yard:
     url: rtsp://admin:{CAM_FRONT_YARD_PASSWORD}@{CAM_FRONT_YARD_IP}:554/Streaming/Channels/101
+    url_type: hikvision
   front_yard_sub:
     url: rtsp://admin:{CAM_FRONT_YARD_PASSWORD}@{CAM_FRONT_YARD_IP}:554/Streaming/Channels/102
+    url_type: hikvision
   gate:
     url: rtsp://admin:{CAM_GATE_PASSWORD}@{CAM_GATE_IP}:554/Streaming/Channels/101
+    url_type: hikvision
   gate_sub:
     url: rtsp://admin:{CAM_GATE_PASSWORD}@{CAM_GATE_IP}:554/Streaming/Channels/102
+    url_type: hikvision
+  # Example: NVR aggregates cameras; channel id is often camera_index * 100 + 1 (e.g. 301).
+  # nvr_side:
+  #   url: rtsp://{NVR_USERNAME}:{NVR_PASSWORD}@{NVR_IP}:554/Streaming/Channels/{CAM_SIDE_ID}01
+  #   url_type: hikvision

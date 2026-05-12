@@ -1,11 +1,15 @@
-"""Compose and parse Hikvision-style RTSP URLs (no Qt; used by the config editor)."""
+"""Compose and parse Hikvision-style RTSP URLs (no Qt; used by config editor and loader).
+
+Paths look like ``.../Streaming/Channels/<expr>``: numeric ids (101/102, NVR channels), or
+placeholder text (e.g. ``{CAM}01``).
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 import logging
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 LOG = logging.getLogger(__name__)
 
@@ -62,21 +66,114 @@ class HikvisionUrlParts:
     channel: int
 
 
+@dataclass(frozen=True)
+class RtspHikEndpointHints:
+    """Best-effort values from ``rtsp://user:pass@host:port[/…]`` plus channel path suffix."""
+
+    user: str
+    password_expr: str
+    host_expr: str
+    port: int
+    #: Text after ``/Streaming/Channels/`` (digits, ``{CAM}01``, etc.) or ``None``.
+    channel_suffix: str | None
+
+
+def extract_rtsp_hik_endpoint_hints(url: str) -> RtspHikEndpointHints | None:
+    u = urlparse(url.strip())
+    if u.scheme != "rtsp":
+        return None
+    parsed = _parse_rtsp_netloc(u.netloc)
+    if parsed is None:
+        return None
+    usr, passwd, host, port = parsed
+    path_nr = ((u.path or "").replace("\\", "/")).rstrip("/")
+    ch_suffix: str | None = None
+    mp = re.search(r"/Streaming/Channels/([^/?#]+)$", path_nr)
+    if mp:
+        ch_suffix = mp.group(1).strip()
+        if not ch_suffix:
+            ch_suffix = None
+    return RtspHikEndpointHints(
+        user=usr,
+        password_expr=passwd,
+        host_expr=host,
+        port=port,
+        channel_suffix=ch_suffix,
+    )
+
+
+def merge_rtsp_netloc_into_url(
+    url: str,
+    user: str,
+    password_expr: str,
+    host_expr: str,
+    port: str | int,
+) -> str:
+    """Replace scheme netloc parts; preserve path/query/fragment (NVR placeholders in path unchanged)."""
+    p = urlparse(url.strip())
+    if p.scheme != "rtsp":
+        return url.strip()
+    host = host_expr.strip()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    uu = user.strip() or "admin"
+    port_s = str(port).strip()
+    if not port_s:
+        port_s = "554"
+    netloc = f"{uu}:{password_expr}@{host}:{port_s}"
+    return urlunparse(
+        (
+            p.scheme,
+            netloc,
+            p.path or "",
+            p.params or "",
+            p.query or "",
+            p.fragment or "",
+        )
+    )
+
+
+def merge_channel_segment_in_hik_path(url: str, channel_expr: str) -> str:
+    """Replace the path suffix after ``/Streaming/Channels/`` (digits or placeholders)."""
+    s = url.strip()
+    ch = channel_expr.strip()
+    if not ch:
+        return s
+    p = urlparse(s)
+    if p.scheme != "rtsp":
+        return s
+    path_nr = ((p.path or "").replace("\\", "/")).rstrip("/")
+    head, sep, _old = path_nr.rpartition("/Streaming/Channels/")
+    if not sep:
+        return s
+    new_path = f"{head}{sep}{ch}"
+    return urlunparse(
+        (
+            p.scheme,
+            p.netloc,
+            new_path,
+            p.params or "",
+            p.query or "",
+            p.fragment or "",
+        )
+    )
+
+
 def build_hikvision_rtsp_url(
     user: str,
     password_expr: str,
     host_expr: str,
     *,
-    port: int = 554,
-    channel: int = 101,
+    port: str | int = 554,
+    channel: str | int = 101,
 ) -> str:
     u = user.strip() or "admin"
     host = host_expr.strip()
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    return (
-        f"rtsp://{u}:{password_expr}@{host}:{port}/Streaming/Channels/{channel}"
-    )
+    port_s = str(port).strip() or "554"
+    ch_s = str(channel).strip() or "101"
+    return f"rtsp://{u}:{password_expr}@{host}:{port_s}/Streaming/Channels/{ch_s}"
 
 
 def try_parse_hikvision_rtsp_url(url: str) -> HikvisionUrlParts | None:
@@ -90,8 +187,8 @@ def try_parse_hikvision_rtsp_url(url: str) -> HikvisionUrlParts | None:
         LOG.debug("URL path does not match Hikvision channels path: %s", u.path)
         return None
     ch = int(m.group(1))
-    if ch not in (101, 102):
-        LOG.debug("Unsupported Hikvision channel in URL: %s", ch)
+    if ch < 1 or ch > 999999:
+        LOG.debug("Unsupported Hikvision channel in URL (out of range): %s", ch)
         return None
     parsed = _parse_rtsp_netloc(u.netloc)
     if parsed is None:

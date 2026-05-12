@@ -18,7 +18,7 @@ depends=('python' 'mpv' 'python-pyqt6' 'python-pyyaml' 'python-cryptography' 'py
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 install=hikvision-viewer.install
 source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('d461c93f47fe9932214c177cef88b62a4ca62db5fffc2b8fdc5963eced8f91ad')
+sha256sums=('91e95964920633d33857034573721a29ed3bd0bb6f22a8979ae66b09fa3b1fed')
 
 build() {
   cd "${pkgname}-${pkgver}"

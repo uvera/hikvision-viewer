@@ -15,6 +15,17 @@ The in-app configuration tab labeled **Playback** adjusts **mpv and display beha
 - **YAML config** under the XDG config directory (default `~/.config/hikvision-viewer/config.yaml`), with `config.example.yaml` as a template.
 - **Hikvision URL helper** in the configuration editor, plus arbitrary RTSP/custom URLs.
 - **`{ENV_VAR}` placeholders** in URLs, loaded from **encrypted `.env.enc`** (OS keyring holds the encryption key).
+
+## Stream `url_type`
+
+Each stream may be a plain URL string or `{ url: ..., url_type: ... }`:
+
+| `url_type` | Meaning |
+|------------|---------|
+| `hikvision` | **Default** if omitted. Hikvision- or NVR-style RTSP paths (`.../Streaming/Channels/<number>`). The editor can show structured fields when the URL parses; otherwise it keeps the URL as a single line while still saving `url_type: hikvision`. |
+| `custom` | Opaque URL (any scheme/string accepted by mpv); the editor does not interpret Hikvision paths. |
+
+Legacy configs without `url_type` keep the old behavior: URLs that match the Hikvision path pattern are treated as **hikvision**, others as **custom**.
 - **Reload config** from the UI without editing files by hand.
 
 ## Requirements

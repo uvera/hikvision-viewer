@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+from typing import Literal
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -26,15 +27,14 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
-    QSpinBox,
     QSplitter,
-    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from hikvision_viewer.config_loader import (
+    StreamYamlSpec,
     app_config_dir,
     load_config_document,
     ordered_stream_names,
@@ -48,7 +48,11 @@ from hikvision_viewer.env_secure import (
     encrypt_plaintext_to_path,
 )
 from hikvision_viewer.hikvision_rtsp import (
+    RtspHikEndpointHints,
     build_hikvision_rtsp_url,
+    extract_rtsp_hik_endpoint_hints,
+    merge_channel_segment_in_hik_path,
+    merge_rtsp_netloc_into_url,
     try_parse_hikvision_rtsp_url,
 )
 
@@ -57,14 +61,18 @@ LOG = logging.getLogger(__name__)
 
 @dataclass
 class StreamRow:
+    """In-memory stream row for the editor. Matches YAML url_type + UI mode."""
+
     name: str
-    use_hikvision: bool = True
+    url_type: Literal["hikvision", "custom"] = "hikvision"
+    #: If True, URL is built from hv_* fields; if False but url_type is hikvision, use url_custom.
+    hikvision_structured: bool = True
     url_custom: str = ""
     hv_user: str = "admin"
     hv_password: str = ""
     hv_host: str = ""
-    hv_port: int = 554
-    hv_channel: int = 101
+    hv_port: str = "554"
+    hv_channel: str = "101"
 
 
 class ConfigEditorDialog(QDialog):
@@ -162,16 +170,13 @@ class ConfigEditorDialog(QDialog):
         rl.addWidget(self._name_edit)
         rl.addLayout(mode_row)
 
-        self._stack = QStackedWidget()
-        rl.addWidget(self._stack, stretch=1)
-
-        hik_frame = QFrame()
-        hik_frame.setObjectName("hikvisionCard")
-        hik_frame.setStyleSheet(
+        self._hik_card = QFrame()
+        self._hik_card.setObjectName("hikvisionCard")
+        self._hik_card.setStyleSheet(
             "#hikvisionCard { background: #2a2a2a; border: 1px solid #444; "
             "border-radius: 6px; padding: 8px; }"
         )
-        hf = QVBoxLayout(hik_frame)
+        hf = QVBoxLayout(self._hik_card)
         hf.addWidget(QLabel("Hikvision RTSP"))
         form = QFormLayout()
         self._hv_user = QLineEdit()
@@ -180,28 +185,24 @@ class ConfigEditorDialog(QDialog):
         self._hv_password.setPlaceholderText("{CAM_PASSWORD} or literal")
         self._hv_host = QLineEdit()
         self._hv_host.setPlaceholderText("192.168.1.10 or {CAM_IP}")
-        self._hv_port = QSpinBox()
-        self._hv_port.setRange(1, 65535)
-        self._hv_port.setValue(554)
-        ch_row = QHBoxLayout()
-        self._ch_main = QRadioButton("Main (channel 101)")
-        self._ch_sub = QRadioButton("Sub (channel 102)")
-        self._ch_main.setChecked(True)
-        self._ch_main.toggled.connect(self._on_hik_field_changed)
-        self._ch_sub.toggled.connect(self._on_hik_field_changed)
-        ch_row.addWidget(self._ch_main)
-        ch_row.addWidget(self._ch_sub)
-        ch_row.addStretch()
+        self._hv_port = QLineEdit()
+        self._hv_port.setPlaceholderText("554 or {NVR_RTSP_PORT}")
+        self._hv_channel = QLineEdit()
+        self._hv_channel.setPlaceholderText("101 / 301 / {CAM_SIDE_ID}01 / …")
+        self._hv_channel.setToolTip(
+            "Trailing path segment after /Streaming/Channels/ — digits or env placeholders."
+        )
         self._hv_user.textChanged.connect(self._on_hik_field_changed)
         self._hv_password.textChanged.connect(self._on_hik_field_changed)
         self._hv_host.textChanged.connect(self._on_hik_field_changed)
-        self._hv_port.valueChanged.connect(self._on_hik_field_changed)
+        self._hv_port.textChanged.connect(self._on_hik_field_changed)
+        self._hv_channel.textChanged.connect(self._on_hik_field_changed)
 
         form.addRow("Username", self._hv_user)
         form.addRow("Password", self._hv_password)
         form.addRow("Host / IP", self._hv_host)
         form.addRow("Port", self._hv_port)
-        form.addRow("Stream", ch_row)
+        form.addRow("Channel", self._hv_channel)
         hf.addLayout(form)
         prev_label = QLabel("Preview")
         prev_label.setStyleSheet("color: #aaa; margin-top: 8px;")
@@ -216,16 +217,38 @@ class ConfigEditorDialog(QDialog):
             "background: #111; padding: 8px; border-radius: 4px;"
         )
         hf.addWidget(self._url_preview)
-        self._stack.addWidget(hik_frame)
+        self._hik_raw_block = QWidget()
+        hik_raw_lay = QVBoxLayout(self._hik_raw_block)
+        hik_raw_lay.setContentsMargins(0, 8, 0, 0)
+        raw_hint = QLabel(
+            "Full RTSP URL (placeholders/NVR paths that do not split into numeric channel).\n"
+            "Saved URL is taken from here. Leaving the field parses user/host/port into the "
+            "fields above when possible (focus out / Tab)."
+        )
+        raw_hint.setWordWrap(True)
+        raw_hint.setStyleSheet("color: #aaa;")
+        self._hik_raw_url = QLineEdit()
+        self._hik_raw_url.setPlaceholderText(
+            "rtsp://{NVR_USER}:{NVR_PASS}@{NVR_IP}:554/Streaming/Channels/…"
+        )
+        self._hik_raw_url.textChanged.connect(self._on_hik_raw_url_changed)
+        self._hik_raw_url.editingFinished.connect(self._on_hik_raw_url_editing_finished)
+        hik_raw_lay.addWidget(raw_hint)
+        hik_raw_lay.addWidget(self._hik_raw_url)
+        hf.addWidget(self._hik_raw_block)
+        self._hik_raw_block.setVisible(False)
+        self._hik_card.setMinimumHeight(120)
+        rl.addWidget(self._hik_card, stretch=1)
 
-        custom_w = QWidget()
-        cv = QVBoxLayout(custom_w)
-        cv.addWidget(QLabel("RTSP / URL"))
+        self._url_panel = QWidget()
+        url_lay = QVBoxLayout(self._url_panel)
+        self._url_panel_title = QLabel("RTSP / URL")
         self._custom_url = QLineEdit()
         self._custom_url.textChanged.connect(self._on_custom_url_changed)
-        cv.addWidget(self._custom_url)
-        cv.addStretch()
-        self._stack.addWidget(custom_w)
+        url_lay.addWidget(self._url_panel_title)
+        url_lay.addWidget(self._custom_url)
+        url_lay.addStretch()
+        rl.addWidget(self._url_panel, stretch=1)
 
         split.addWidget(right_scroll)
         split.setStretchFactor(1, 2)
@@ -298,7 +321,7 @@ class ConfigEditorDialog(QDialog):
         self._loading_ui = True
         data = load_config_document(self._config_path)
         raw_streams = parse_streams_raw(data)
-        self._rows = [self._row_from_url(n, u) for n, u in raw_streams.items()]
+        self._rows = [self._row_from_spec(n, s) for n, s in raw_streams.items()]
 
         if not self._rows:
             self._rows.append(StreamRow(name="camera_1"))
@@ -400,19 +423,45 @@ class ConfigEditorDialog(QDialog):
             return self._config_path.parent / ".env.enc"
         return app_config_dir() / ".env.enc"
 
-    def _row_from_url(self, name: str, url: str) -> StreamRow:
-        parts = try_parse_hikvision_rtsp_url(url)
+    def _row_from_spec(self, name: str, spec: StreamYamlSpec) -> StreamRow:
+        if spec.url_type == "custom":
+            return StreamRow(
+                name=name,
+                url_type="custom",
+                hikvision_structured=False,
+                url_custom=spec.url,
+            )
+        parts = try_parse_hikvision_rtsp_url(spec.url)
         if parts is not None:
             return StreamRow(
                 name=name,
-                use_hikvision=True,
+                url_type="hikvision",
+                hikvision_structured=True,
                 hv_user=parts.user,
                 hv_password=parts.password_expr,
                 hv_host=parts.host_expr,
-                hv_port=parts.port,
-                hv_channel=parts.channel,
+                hv_port=str(parts.port),
+                hv_channel=str(parts.channel),
             )
-        return StreamRow(name=name, use_hikvision=False, url_custom=url)
+        hints = extract_rtsp_hik_endpoint_hints(spec.url)
+        if hints is not None:
+            return StreamRow(
+                name=name,
+                url_type="hikvision",
+                hikvision_structured=False,
+                url_custom=spec.url,
+                hv_user=hints.user,
+                hv_password=hints.password_expr,
+                hv_host=hints.host_expr,
+                hv_port=str(hints.port),
+                hv_channel=self._hints_channel_field(hints),
+            )
+        return StreamRow(
+            name=name,
+            url_type="hikvision",
+            hikvision_structured=False,
+            url_custom=spec.url,
+        )
 
     def _refresh_list_widget(self) -> None:
         self._list.clear()
@@ -422,42 +471,84 @@ class ConfigEditorDialog(QDialog):
     def _current_row_index(self) -> int:
         return self._list.currentRow()
 
+    def _apply_editor_panels_for_row(self, r: StreamRow) -> None:
+        """Custom mode: URL panel only. Hikvision: always show fields card + optional full-URL row."""
+        if r.url_type == "custom":
+            self._hik_card.setVisible(False)
+            self._url_panel.setVisible(True)
+            self._url_panel_title.setText("Custom RTSP / URL")
+            return
+        self._hik_card.setVisible(True)
+        self._url_panel.setVisible(False)
+        opaque = not r.hikvision_structured
+        self._hik_raw_block.setVisible(opaque)
+
     def _sync_ui_to_row(self, idx: int) -> None:
         if idx < 0 or idx >= len(self._rows):
             return
         r = self._rows[idx]
         r.name = self._name_edit.text().strip()
-        r.use_hikvision = self._mode_hik.isChecked()
-        if r.use_hikvision:
+        r.url_type = "hikvision" if self._mode_hik.isChecked() else "custom"
+        if r.url_type == "custom":
+            r.hikvision_structured = False
+            r.url_custom = self._custom_url.text().strip()
+        elif r.url_type == "hikvision" and not r.hikvision_structured:
+            self._sync_opaque_rtsp_fields_to_raw_line(row_idx=idx)
             r.hv_user = self._hv_user.text().strip() or "admin"
             r.hv_password = self._hv_password.text()
             r.hv_host = self._hv_host.text().strip()
-            r.hv_port = int(self._hv_port.value())
-            r.hv_channel = 101 if self._ch_main.isChecked() else 102
+            r.hv_port = self._hv_port.text().strip() or "554"
+            r.hv_channel = self._hv_channel.text().strip() or "101"
         else:
-            r.url_custom = self._custom_url.text().strip()
+            r.hikvision_structured = True
+            r.hv_user = self._hv_user.text().strip() or "admin"
+            r.hv_password = self._hv_password.text()
+            r.hv_host = self._hv_host.text().strip()
+            r.hv_port = self._hv_port.text().strip() or "554"
+            r.hv_channel = self._hv_channel.text().strip() or "101"
 
     def _load_row_into_ui(self, idx: int) -> None:
         if idx < 0 or idx >= len(self._rows):
             return
-        r = self._rows[idx]
-        self._name_edit.setText(r.name)
-        self._mode_hik.setChecked(r.use_hikvision)
-        self._mode_custom.setChecked(not r.use_hikvision)
-        self._stack.setCurrentIndex(0 if r.use_hikvision else 1)
-        self._hv_user.setText(r.hv_user)
-        self._hv_password.setText(r.hv_password)
-        self._hv_host.setText(r.hv_host)
-        self._hv_port.setValue(r.hv_port)
-        if r.hv_channel == 102:
-            self._ch_sub.setChecked(True)
-        else:
-            self._ch_main.setChecked(True)
-        self._custom_url.setText(r.url_custom)
-        self._update_hik_preview()
+        # Fill URL fields before radios so any stray signals see correct text;
+        # block mode handler during reload/list switches.
+        was_loading = self._loading_ui
+        self._loading_ui = True
+        try:
+            r = self._rows[idx]
+            self._name_edit.setText(r.name)
+            self._hv_user.setText(r.hv_user)
+            self._hv_password.setText(r.hv_password)
+            self._hv_host.setText(r.hv_host)
+            self._hv_port.setText(r.hv_port if r.hv_port else "554")
+            self._hv_channel.setText(r.hv_channel if r.hv_channel else "101")
+            if not r.hikvision_structured and r.url_type == "hikvision":
+                self._hik_raw_url.setText(r.url_custom)
+            else:
+                self._hik_raw_url.clear()
+            self._custom_url.setText(r.url_custom)
+            self._mode_hik.setChecked(r.url_type == "hikvision")
+            self._mode_custom.setChecked(r.url_type == "custom")
+            self._apply_editor_panels_for_row(r)
+            self._update_hik_preview()
+        finally:
+            self._loading_ui = was_loading
+
+    @staticmethod
+    def _hints_channel_field(hints: RtspHikEndpointHints) -> str:
+        return hints.channel_suffix if hints.channel_suffix is not None else "101"
+
+    def _apply_rtsp_hints_to_hv_widgets(self, hints: RtspHikEndpointHints) -> None:
+        self._hv_user.setText(hints.user)
+        self._hv_password.setText(hints.password_expr)
+        self._hv_host.setText(hints.host_expr)
+        self._hv_port.setText(str(hints.port))
+        self._hv_channel.setText(self._hints_channel_field(hints))
 
     def _row_effective_url(self, r: StreamRow) -> str:
-        if r.use_hikvision:
+        if r.url_type == "custom":
+            return r.url_custom.strip()
+        if r.hikvision_structured:
             return build_hikvision_rtsp_url(
                 r.hv_user,
                 r.hv_password,
@@ -467,18 +558,70 @@ class ConfigEditorDialog(QDialog):
             )
         return r.url_custom.strip()
 
-    def _update_hik_preview(self) -> None:
-        if not self._mode_hik.isChecked():
+    def _sync_opaque_rtsp_fields_to_raw_line(self, row_idx: int | None = None) -> None:
+        """opaque Hikvision: push user/host/port/channel fields into saved URL text.
+
+        Pass ``row_idx`` when syncing a stream that is **not** the list's current row
+        (e.g. before switching streams: widgets still show that row).
+        """
+        if (
+            self._loading_ui
+            or not self._mode_hik.isChecked()
+        ):
             return
-        idx = self._current_row_index()
-        if idx < 0:
-            self._url_preview.setText("")
+        idx = (
+            row_idx if row_idx is not None else self._current_row_index()
+        )
+        if idx < 0 or idx >= len(self._rows):
             return
+        r = self._rows[idx]
+        if r.url_type != "hikvision" or r.hikvision_structured:
+            return
+        base = self._hik_raw_url.text().strip() or r.url_custom.strip()
         user = self._hv_user.text().strip() or "admin"
         password = self._hv_password.text()
         host = self._hv_host.text().strip()
-        port = int(self._hv_port.value())
-        ch = 101 if self._ch_main.isChecked() else 102
+        port = self._hv_port.text().strip() or "554"
+        ch = self._hv_channel.text().strip() or "101"
+        if base:
+            merged = merge_rtsp_netloc_into_url(base, user, password, host, port)
+            merged = merge_channel_segment_in_hik_path(merged, ch)
+        else:
+            merged = build_hikvision_rtsp_url(
+                user, password, host, port=port, channel=ch
+            )
+        was = self._loading_ui
+        self._loading_ui = True
+        try:
+            self._hik_raw_url.setText(merged)
+            r.url_custom = merged
+        finally:
+            self._loading_ui = was
+
+    def _update_hik_preview(self) -> None:
+        if not self._mode_hik.isChecked():
+            return
+        # Do not rely on *_hik_card / _hik_raw_block *.isVisible() — Qt returns False
+        # for widgets on a non-current tab or before layout, which hid the preview
+        # until a field emitted textChanged.
+        if not self._rows:
+            self._url_preview.setText("")
+            return
+        idx = self._current_row_index()
+        if 0 <= idx < len(self._rows):
+            r = self._rows[idx]
+            if r.url_type == "hikvision" and not r.hikvision_structured:
+                url = (
+                    self._hik_raw_url.text().strip()
+                    or (r.url_custom or "").strip()
+                )
+                self._url_preview.setText(url)
+                return
+        user = self._hv_user.text().strip() or "admin"
+        password = self._hv_password.text()
+        host = self._hv_host.text().strip()
+        port = self._hv_port.text().strip() or "554"
+        ch = self._hv_channel.text().strip() or "101"
         self._url_preview.setText(
             build_hikvision_rtsp_url(user, password, host, port=port, channel=ch)
         )
@@ -517,41 +660,64 @@ class ConfigEditorDialog(QDialog):
         try:
             r = self._rows[idx]
             if self._mode_custom.isChecked():
-                user = self._hv_user.text().strip() or "admin"
-                password = self._hv_password.text()
-                host = self._hv_host.text().strip()
-                port = int(self._hv_port.value())
-                ch = 101 if self._ch_main.isChecked() else 102
-                r.url_custom = build_hikvision_rtsp_url(
-                    user, password, host, port=port, channel=ch
-                )
-                r.use_hikvision = False
+                if r.url_type == "hikvision" and not r.hikvision_structured:
+                    r.url_custom = self._hik_raw_url.text().strip()
+                elif r.url_type == "hikvision" and r.hikvision_structured:
+                    user = self._hv_user.text().strip() or "admin"
+                    password = self._hv_password.text()
+                    host = self._hv_host.text().strip()
+                    port = self._hv_port.text().strip() or "554"
+                    ch = self._hv_channel.text().strip() or "101"
+                    r.url_custom = build_hikvision_rtsp_url(
+                        user, password, host, port=port, channel=ch
+                    )
+                else:
+                    r.url_custom = self._custom_url.text().strip()
+                r.url_type = "custom"
+                r.hikvision_structured = False
                 self._custom_url.setText(r.url_custom)
-                self._stack.setCurrentIndex(1)
+                self._apply_editor_panels_for_row(r)
             else:
-                r.use_hikvision = True
-                parts = try_parse_hikvision_rtsp_url(self._custom_url.text().strip())
+                r.url_type = "hikvision"
+                src = self._custom_url.text().strip()
+                parts = try_parse_hikvision_rtsp_url(src)
                 if parts is not None:
+                    r.hikvision_structured = True
                     r.hv_user = parts.user
                     r.hv_password = parts.password_expr
                     r.hv_host = parts.host_expr
-                    r.hv_port = parts.port
-                    r.hv_channel = parts.channel
-                self._hv_user.setText(r.hv_user)
-                self._hv_password.setText(r.hv_password)
-                self._hv_host.setText(r.hv_host)
-                self._hv_port.setValue(r.hv_port)
-                if r.hv_channel == 102:
-                    self._ch_sub.setChecked(True)
+                    r.hv_port = str(parts.port)
+                    r.hv_channel = str(parts.channel)
+                    self._hv_user.setText(r.hv_user)
+                    self._hv_password.setText(r.hv_password)
+                    self._hv_host.setText(r.hv_host)
+                    self._hv_port.setText(r.hv_port)
+                    self._hv_channel.setText(r.hv_channel)
+                    self._hik_raw_url.clear()
                 else:
-                    self._ch_main.setChecked(True)
-                self._stack.setCurrentIndex(0)
+                    r.hikvision_structured = False
+                    r.url_custom = src
+                    self._hik_raw_url.setText(src)
+                    hints = extract_rtsp_hik_endpoint_hints(src)
+                    if hints is not None:
+                        self._apply_rtsp_hints_to_hv_widgets(hints)
+                self._apply_editor_panels_for_row(r)
                 self._update_hik_preview()
         finally:
             self._loading_ui = False
 
     def _on_hik_field_changed(self, *_args: object) -> None:
         if self._loading_ui:
+            return
+        idx = self._current_row_index()
+        if (
+            self._mode_hik.isChecked()
+            and 0 <= idx < len(self._rows)
+            and self._rows[idx].url_type == "hikvision"
+            and not self._rows[idx].hikvision_structured
+        ):
+            self._sync_opaque_rtsp_fields_to_raw_line()
+            self._url_preview.setText(self._hik_raw_url.text().strip())
             return
         self._update_hik_preview()
 
@@ -561,6 +727,34 @@ class ConfigEditorDialog(QDialog):
         idx = self._current_row_index()
         if idx >= 0 and self._mode_custom.isChecked():
             self._rows[idx].url_custom = self._custom_url.text()
+
+    def _on_hik_raw_url_changed(self, *_args: object) -> None:
+        if self._loading_ui:
+            return
+        idx = self._current_row_index()
+        if (
+            idx >= 0
+            and self._mode_hik.isChecked()
+            and self._rows[idx].url_type == "hikvision"
+            and not self._rows[idx].hikvision_structured
+        ):
+            self._rows[idx].url_custom = self._hik_raw_url.text()
+            self._update_hik_preview()
+
+    def _on_hik_raw_url_editing_finished(self) -> None:
+        if self._loading_ui:
+            return
+        idx = self._current_row_index()
+        if idx < 0 or not self._mode_hik.isChecked():
+            return
+        r = self._rows[idx]
+        if r.url_type != "hikvision" or r.hikvision_structured:
+            return
+        t = self._hik_raw_url.text().strip()
+        hints = extract_rtsp_hik_endpoint_hints(t)
+        if hints is None:
+            return
+        self._apply_rtsp_hints_to_hv_widgets(hints)
 
     def _add_stream(self) -> None:
         idx = self._current_row_index()
@@ -590,11 +784,11 @@ class ConfigEditorDialog(QDialog):
         self._prev_list_row = -1
         self._list.setCurrentRow(new_i)
 
-    def _collect_streams_dict(self) -> dict[str, str]:
+    def _collect_stream_specs(self) -> dict[str, StreamYamlSpec]:
         idx = self._current_row_index()
         if idx >= 0:
             self._sync_ui_to_row(idx)
-        out: dict[str, str] = {}
+        out: dict[str, StreamYamlSpec] = {}
         names_seen: set[str] = set()
         for r in self._rows:
             name = r.name.strip()
@@ -606,7 +800,7 @@ class ConfigEditorDialog(QDialog):
             url = self._row_effective_url(r).strip()
             if not url:
                 raise ValueError(f"Stream {name!r} needs a URL.")
-            out[name] = url
+            out[name] = StreamYamlSpec(url=url, url_type=r.url_type)
         return out
 
     def _viewer_dict_from_ui(self, stream_keys: set[str]) -> dict:
@@ -624,14 +818,14 @@ class ConfigEditorDialog(QDialog):
         if idx >= 0:
             self._sync_ui_to_row(idx)
         try:
-            streams = self._collect_streams_dict()
+            stream_specs = self._collect_stream_specs()
         except ValueError as e:
             QMessageBox.warning(self, "Configuration", str(e))
             return
 
         data = load_config_document(self._config_path)
-        data["streams"] = streams_to_yaml_entries(streams)
-        viewer = self._viewer_dict_from_ui(set(streams.keys()))
+        data["streams"] = streams_to_yaml_entries(stream_specs)
+        viewer = self._viewer_dict_from_ui(set(stream_specs.keys()))
         data["viewer"] = viewer
         self._viewer_changed = viewer != (self._initial_viewer_yaml or {})
 
@@ -643,7 +837,7 @@ class ConfigEditorDialog(QDialog):
         LOG.info(
             "Saved configuration via editor: %s (%d streams)",
             self._config_path,
-            len(streams),
+            len(stream_specs),
         )
 
         if not self._env_edit.isEnabled():

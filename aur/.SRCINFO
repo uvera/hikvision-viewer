@@ -19,6 +19,6 @@ pkgbase = hikvision-viewer
 	depends = python-dotenv
 	depends = python-mpv
 	source = hikvision-viewer-0.3.0.tar.gz
-	sha256sums = d461c93f47fe9932214c177cef88b62a4ca62db5fffc2b8fdc5963eced8f91ad
+	sha256sums = 91e95964920633d33857034573721a29ed3bd0bb6f22a8979ae66b09fa3b1fed
 
 pkgname = hikvision-viewer
