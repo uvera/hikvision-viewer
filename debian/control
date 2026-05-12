@@ -24,6 +24,7 @@ Depends: ${misc:Depends},
          python3-mpv,
          python3-pyqt6,
          python3-yaml
+Recommends: ffmpeg
 Description: PyQt6 multi-stream RTSP viewer for IP cameras
  View multiple RTSP streams from IP cameras (e.g. Hikvision) in a tiled grid.
  Playback uses mpv via the python3-mpv bindings.

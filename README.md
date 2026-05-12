@@ -12,6 +12,7 @@ The in-app configuration tab labeled **Playback** adjusts **mpv and display beha
 ## Features
 
 - **Grid** and **Single** view; keyboard shortcuts (arrow keys, `G` to toggle view, `F11` fullscreen, `Esc` to leave fullscreen).
+- **Single view sidebar**: clickable camera list with static previews (via `ffmpeg` snapshots when available), refreshed about every 5 seconds; click a preview to switch the active camera.
 - **YAML config** under the XDG config directory (default `~/.config/hikvision-viewer/config.yaml`), with `config.example.yaml` as a template.
 - **Hikvision URL helper** in the configuration editor, plus arbitrary RTSP/custom URLs.
 - **`{ENV_VAR}` placeholders** in URLs, loaded from **encrypted `.env.enc`** (OS keyring holds the encryption key).
@@ -32,6 +33,7 @@ Legacy configs without `url_type` keep the old behavior: URLs that match the Hik
 
 - **Python** 3.10+
 - **mpv** installed on the system (the `python-mpv` package talks to libmpv)
+- **ffmpeg** on `PATH` for single-view sidebar thumbnails (optional; placeholders are shown if missing or capture fails)
 
 ## Install
 

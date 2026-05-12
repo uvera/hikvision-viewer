@@ -7,16 +7,21 @@ import shutil
 import socket
 import sys
 import tempfile
+from collections import deque
+from pathlib import Path
 
 import mpv
-from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
+from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPainter, QPalette, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -42,6 +47,40 @@ from hikvision_viewer.logging_utils import configure_logging
 
 LOG = logging.getLogger(__name__)
 MPV_LOG = logging.getLogger("hikvision_viewer.mpv")
+
+_SIDEBAR_THUMB_W = 120
+_SIDEBAR_THUMB_H = 100
+_THUMB_REFRESH_MS = 5000
+
+
+def _sidebar_placeholder_pixmap(title: str, width: int) -> QPixmap:
+    pm = QPixmap(max(width, 1), _SIDEBAR_THUMB_H)
+    pm.fill(QColor(40, 40, 40))
+    p = QPainter(pm)
+    p.setPen(QColor(140, 140, 140))
+    font = QFont()
+    font.setPixelSize(11)
+    p.setFont(font)
+    label = (title[:10] + "…") if len(title) > 10 else title
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, label or "?")
+    p.end()
+    return pm
+
+
+def _fit_sidebar_thumb_pixmap(pm: QPixmap, tw: int, th: int) -> QPixmap:
+    """Scale and center-crop so the result fills a tw×th rectangle (full-width previews)."""
+    if pm.isNull() or tw < 1 or th < 1:
+        return pm
+    scaled = pm.scaled(
+        tw,
+        th,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    sw, sh = scaled.width(), scaled.height()
+    x = max(0, (sw - tw) // 2)
+    y = max(0, (sh - th) // 2)
+    return scaled.copy(QRect(x, y, tw, th))
 
 
 def _viewer_state_path():
@@ -536,6 +575,10 @@ class StreamTile(QWidget):
     @property
     def stream_name(self) -> str:
         return self._title
+
+    @property
+    def stream_url(self) -> str:
+        return self._url
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -1078,17 +1121,297 @@ class MainWindow(QMainWindow):
         self._scroll.setWidget(self._grid_host)
         outer.addWidget(self._scroll, stretch=1)
 
+        self._single_view_host = QWidget()
+        self._single_view_host.setStyleSheet("background: #111;")
+        single_outer = QHBoxLayout(self._single_view_host)
+        single_outer.setContentsMargins(0, 0, 0, 0)
+        single_outer.setSpacing(8)
+
+        self._camera_sidebar = QListWidget()
+        self._camera_sidebar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._camera_sidebar.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._camera_sidebar.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._camera_sidebar.setMaximumWidth(260)
+        self._camera_sidebar.setMinimumWidth(200)
+        self._camera_sidebar.setStyleSheet(
+            "QListWidget { background: #1a1a1a; border: none; outline: none; }"
+            "QListWidget::item { padding: 6px; border-radius: 4px; }"
+            "QListWidget::item:selected { background: #3a5a80; }"
+            "QListWidget::item:hover { background: #2a2a2a; }"
+        )
+        self._camera_sidebar.currentRowChanged.connect(self._on_sidebar_current_row_changed)
+
         self._stack = QStackedWidget()
         self._stack.setStyleSheet("background: #111;")
         self._stack.currentChanged.connect(self._on_stack_index_changed)
-        outer.addWidget(self._stack, stretch=1)
-        self._stack.hide()
+
+        single_outer.addWidget(self._camera_sidebar)
+        single_outer.addWidget(self._stack, stretch=1)
+
+        outer.addWidget(self._single_view_host, stretch=1)
+        self._single_view_host.hide()
+
+        self._thumb_generation = 0
+        self._thumb_cycle_active = False
+        self._thumb_queue: deque[tuple[int, str]] = deque()
+        self._thumb_proc: QProcess | None = None
+        self._thumb_out_path: Path | None = None
+        self._thumb_refresh_timer = QTimer(self)
+        self._thumb_refresh_timer.setInterval(_THUMB_REFRESH_MS)
+        self._thumb_refresh_timer.timeout.connect(self._start_thumbnail_refresh_cycle)
 
         self._setup_shortcuts()
         self._update_view_toolbar_visibility()
         self._update_nav_buttons()
 
         self._reload()
+
+    def _on_sidebar_current_row_changed(self, row: int) -> None:
+        if row < 0 or not self._single_view:
+            return
+        if row >= len(self._tiles):
+            return
+        self._stack.setCurrentIndex(row)
+
+    def _sidebar_thumb_label_at(self, row: int) -> QLabel | None:
+        it = self._camera_sidebar.item(row)
+        if it is None:
+            return None
+        w = self._camera_sidebar.itemWidget(it)
+        if w is None:
+            return None
+        return w.findChild(QLabel, "sidebarThumb")
+
+    def _sync_sidebar_with_stack(self) -> None:
+        if not self._single_view or not self._tiles:
+            return
+        idx = self._stack.currentIndex()
+        if idx < 0 or idx >= self._camera_sidebar.count():
+            return
+        self._camera_sidebar.blockSignals(True)
+        try:
+            self._camera_sidebar.setCurrentRow(idx)
+        finally:
+            self._camera_sidebar.blockSignals(False)
+
+    def _apply_sidebar_thumb_placeholder(self, row: int) -> None:
+        if row < 0 or row >= len(self._tiles):
+            return
+        thumb = self._sidebar_thumb_label_at(row)
+        if thumb is None:
+            return
+        name = self._tiles[row].stream_name
+        tw = self._sidebar_thumb_target_width()
+        thumb.setPixmap(_sidebar_placeholder_pixmap(name, tw))
+
+    def _sidebar_thumb_target_width(self) -> int:
+        vp = self._camera_sidebar.viewport()
+        inner = vp.width() - 28
+        return max(_SIDEBAR_THUMB_W, inner)
+
+    def _kill_thumb_proc_if_still(self, proc: QProcess) -> None:
+        if proc is not self._thumb_proc:
+            return
+        if proc.state() != QProcess.ProcessState.NotRunning:
+            proc.kill()
+
+    def _cancel_thumbnail_cycle(self) -> None:
+        self._thumb_queue.clear()
+        self._thumb_cycle_active = False
+        if self._thumb_proc is not None:
+            p = self._thumb_proc
+            self._thumb_proc = None
+            try:
+                p.kill()
+            except Exception:
+                pass
+            p.deleteLater()
+        if self._thumb_out_path is not None:
+            try:
+                self._thumb_out_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._thumb_out_path = None
+
+    def _start_thumbnail_refresh_cycle(self) -> None:
+        if not self._single_view or not self._tiles:
+            return
+        if self._thumb_cycle_active:
+            return
+        gen = self._thumb_generation
+        self._thumb_cycle_active = True
+        self._thumb_queue.clear()
+        for i, t in enumerate(self._tiles):
+            self._thumb_queue.append((i, t.stream_url))
+        self._thumb_process_next(gen)
+
+    def _thumb_process_next(self, gen: int) -> None:
+        if gen != self._thumb_generation:
+            self._thumb_cycle_active = False
+            self._thumb_queue.clear()
+            return
+        exe = shutil.which("ffmpeg")
+        if not exe:
+            while self._thumb_queue:
+                r, _ = self._thumb_queue.popleft()
+                self._apply_sidebar_thumb_placeholder(r)
+            self._thumb_cycle_active = False
+            return
+        if not self._thumb_queue:
+            self._thumb_cycle_active = False
+            return
+
+        row, url = self._thumb_queue.popleft()
+        fd, path_str = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        out = Path(path_str)
+        self._thumb_out_path = out
+
+        proc = QProcess(self)
+        self._thumb_proc = proc
+        proc.finished.connect(
+            lambda ec, es, g=gen, r=row, p=out: self._on_thumb_proc_finished(ec, es, g, r, p)
+        )
+        args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            url,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "5",
+            "-y",
+            str(out),
+        ]
+        try:
+            proc.start(exe, args)
+        except Exception:
+            LOG.exception("Failed starting ffmpeg thumbnail for row %s", row)
+            self._thumb_proc = None
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._thumb_out_path = None
+            self._apply_sidebar_thumb_placeholder(row)
+            QTimer.singleShot(0, lambda: self._thumb_process_next(gen))
+            return
+
+        if not proc.waitForStarted(4000):
+            LOG.warning("ffmpeg failed to start for sidebar thumbnail row %s", row)
+            proc.kill()
+            proc.waitForFinished(1000)
+            proc.deleteLater()
+            self._thumb_proc = None
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._thumb_out_path = None
+            self._apply_sidebar_thumb_placeholder(row)
+            QTimer.singleShot(0, lambda: self._thumb_process_next(gen))
+            return
+
+        QTimer.singleShot(8000, lambda p=proc: self._kill_thumb_proc_if_still(p))
+
+    def _on_thumb_proc_finished(
+        self,
+        exit_code: int,
+        exit_status: QProcess.ExitStatus,
+        gen: int,
+        row: int,
+        out: Path,
+    ) -> None:
+        if self._thumb_proc is not None:
+            self._thumb_proc.deleteLater()
+            self._thumb_proc = None
+        self._thumb_out_path = None
+
+        if gen != self._thumb_generation:
+            self._thumb_cycle_active = False
+            self._thumb_queue.clear()
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+
+        usable = out.is_file() and out.stat().st_size > 0
+        try:
+            if usable:
+                img = QImage(str(out))
+                if not img.isNull():
+                    tw = self._sidebar_thumb_target_width()
+                    pm_src = QPixmap.fromImage(img)
+                    pm = _fit_sidebar_thumb_pixmap(
+                        pm_src, tw, _SIDEBAR_THUMB_H
+                    )
+                    if 0 <= row < self._camera_sidebar.count():
+                        thumb = self._sidebar_thumb_label_at(row)
+                        if thumb is not None:
+                            thumb.setPixmap(pm)
+                else:
+                    self._apply_sidebar_thumb_placeholder(row)
+            else:
+                self._apply_sidebar_thumb_placeholder(row)
+        finally:
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        QTimer.singleShot(0, lambda: self._thumb_process_next(gen))
+
+    def _rebuild_camera_sidebar(self) -> None:
+        self._cancel_thumbnail_cycle()
+        self._thumb_generation += 1
+        self._camera_sidebar.clear()
+        for t in self._tiles:
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(248, _SIDEBAR_THUMB_H + 40))
+            row_w = QWidget()
+            row_w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            v = QVBoxLayout(row_w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(4)
+            tw = self._sidebar_thumb_target_width()
+            thumb = QLabel()
+            thumb.setObjectName("sidebarThumb")
+            thumb.setMinimumHeight(_SIDEBAR_THUMB_H)
+            thumb.setMaximumHeight(_SIDEBAR_THUMB_H)
+            thumb.setMinimumWidth(1)
+            thumb.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+            thumb.setScaledContents(True)
+            thumb.setStyleSheet("background: #000; border: 1px solid #333;")
+            thumb.setPixmap(_sidebar_placeholder_pixmap(t.stream_name, tw))
+            thumb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            name_lbl = QLabel(t.stream_name)
+            name_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
+            name_lbl.setWordWrap(True)
+            name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            v.addWidget(thumb)
+            v.addWidget(name_lbl)
+            self._camera_sidebar.addItem(item)
+            self._camera_sidebar.setItemWidget(item, row_w)
+
+    def _update_thumbnail_timer_for_mode(self) -> None:
+        if self._single_view and self._tiles:
+            if not self._thumb_refresh_timer.isActive():
+                self._thumb_refresh_timer.start()
+            QTimer.singleShot(200, self._start_thumbnail_refresh_cycle)
+        else:
+            self._thumb_refresh_timer.stop()
+            self._cancel_thumbnail_cycle()
 
     def _edit_configuration(self) -> None:
         path = resolve_config_path()
@@ -1200,7 +1523,7 @@ class MainWindow(QMainWindow):
             self._detach_tiles_from_layouts()
             if not self._tiles:
                 self._scroll.setVisible(True)
-                self._stack.setVisible(False)
+                self._single_view_host.setVisible(False)
             elif self._single_view:
                 for t in self._tiles:
                     self._stack.addWidget(t)
@@ -1209,7 +1532,7 @@ class MainWindow(QMainWindow):
                 self._stack.setCurrentIndex(idx)
                 self._single_index = idx
                 self._scroll.setVisible(False)
-                self._stack.setVisible(True)
+                self._single_view_host.setVisible(True)
             else:
                 cols = 2 if len(self._tiles) <= 4 else 3
                 for i, t in enumerate(self._tiles):
@@ -1221,7 +1544,7 @@ class MainWindow(QMainWindow):
                 self._grid_host.updateGeometry()
                 self._scroll.updateGeometry()
                 self._scroll.setVisible(True)
-                self._stack.setVisible(False)
+                self._single_view_host.setVisible(False)
         finally:
             self._stack.blockSignals(False)
 
@@ -1233,6 +1556,8 @@ class MainWindow(QMainWindow):
         self._refresh_status_text()
         self._persist_viewer_state()
         self._sync_single_view_audio_mute()
+        self._sync_sidebar_with_stack()
+        self._update_thumbnail_timer_for_mode()
 
     def _sync_single_view_audio_mute(self) -> None:
         if not self._tiles:
@@ -1267,6 +1592,7 @@ class MainWindow(QMainWindow):
     def _on_stack_index_changed(self, index: int) -> None:
         if self._single_view and index >= 0:
             self._single_index = index
+        self._sync_sidebar_with_stack()
         self._sync_single_view_audio_mute()
         self._refresh_status_text()
         self._persist_viewer_state()
@@ -1299,6 +1625,10 @@ class MainWindow(QMainWindow):
             self._status.setText(self._status_base)
 
     def _clear_grid(self) -> None:
+        self._thumb_refresh_timer.stop()
+        self._cancel_thumbnail_cycle()
+        self._thumb_generation += 1
+        self._camera_sidebar.clear()
         for t in self._tiles:
             t.shutdown()
         self._tiles.clear()
@@ -1349,6 +1679,7 @@ class MainWindow(QMainWindow):
             url = streams[name]
             tile = StreamTile(name, url, subprocess=self._subprocess)
             self._tiles.append(tile)
+        self._rebuild_camera_sidebar()
         LOG.info("Loaded %d stream tiles", len(self._tiles))
 
         if prev_name in names:
